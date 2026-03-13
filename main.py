@@ -15,6 +15,7 @@ from handlers.profile import handle_profile
 from handlers.stats import handle_stats
 from handlers.stats_reset import handle_stats_reset
 from handlers.summary import handle_summary
+from scheduler import scheduler_loop
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +37,8 @@ dp.message()(store_message)
 
 async def on_startup() -> None:
     await db.init_db()
+    # Start scheduler as a background task
+    asyncio.create_task(scheduler_loop(bot))
     logger.info("Бот запущен.")
 
 

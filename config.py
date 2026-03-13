@@ -33,5 +33,10 @@ DB_POOL_MAX: int = int(os.getenv("DB_POOL_MAX", "10"))
 SUMMARY_DEFAULT_MESSAGES: int = int(os.getenv("SUMMARY_DEFAULT_MESSAGES", "100"))
 SUMMARY_MAX_MESSAGES: int = int(os.getenv("SUMMARY_MAX_MESSAGES", "200"))
 
-# Profile: how many of the user's latest messages to analyse
+# Profile
 PROFILE_MAX_MESSAGES: int = int(os.getenv("PROFILE_MAX_MESSAGES", "500"))
+
+# Scheduler: interval between messages in minutes (random within range)
+# Default: every 90–150 min → ~10 messages per 09:00–22:00 window
+SCHEDULER_INTERVAL_MIN: int = int(os.getenv("SCHEDULER_INTERVAL_MIN", "90"))
+SCHEDULER_INTERVAL_MAX: int = int(os.getenv("SCHEDULER_INTERVAL_MAX", "150"))
