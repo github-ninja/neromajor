@@ -36,9 +36,10 @@ dp.message()(store_message)
 
 async def on_startup() -> None:
     await db.init_db()
-    set_bot(bot)  # inject bot into message handler for reactive responses
+    me = await bot.get_me()
+    set_bot(bot, me.id, me.username or "")
     asyncio.create_task(scheduler_loop(bot))
-    logger.info("Бот запущен.")
+    logger.info("Бот запущен. ID=%d, username=@%s.", me.id, me.username)
 
 
 async def on_shutdown() -> None:

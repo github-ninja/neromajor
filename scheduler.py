@@ -6,8 +6,7 @@ Scheduler: two modes of unprompted messages from the Major.
    Fires with 15% probability, but no more than once per 30 minutes per chat.
 
 2. PROACTIVE — a background loop that sends 2–3 initiative messages per day
-   to each active chat during the allowed time window (09:00–22:00 MSK),
-   regardless of chat activity.
+   to each active chat during the allowed time window (09:00–22:00 MSK).
 """
 
 import asyncio
@@ -24,10 +23,9 @@ from utils import safe_generate_content, escape_html
 
 logger = logging.getLogger(__name__)
 
-# Moscow time = UTC+3
 _TZ_OFFSET = timedelta(hours=3)
-_HOUR_START = 9   # 09:00 MSK
-_HOUR_END   = 22  # 22:00 MSK
+_HOUR_START = 9
+_HOUR_END   = 22
 
 # Per-chat cooldown tracker: chat_id → datetime of last bot message
 _last_sent: dict[int, datetime] = {}
@@ -150,11 +148,7 @@ def _fetch_random_citizen(chat_id: int) -> dict | None:
 
 
 def _check_conversation_activity(chat_id: int) -> bool:
-    """
-    Return True if there are 5+ messages from 2+ distinct users
-    in the last SCHEDULER_ACTIVITY_WINDOW minutes.
-    """
-    window = timedelta(minutes=config.SCHEDULER_ACTIVITY_WINDOW)
+    """Return True if 5+ messages from 2+ users in the last N minutes."""
     with db.get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -166,12 +160,11 @@ def _check_conversation_activity(chat_id: int) -> bool:
                 (chat_id, f"{config.SCHEDULER_ACTIVITY_WINDOW} minutes"),
             )
             row = cur.fetchone()
-    msg_count, user_count = row[0], row[1]
-    return msg_count >= config.SCHEDULER_ACTIVITY_MIN_MESSAGES and user_count >= 2
+    return row[0] >= config.SCHEDULER_ACTIVITY_MIN_MESSAGES and row[1] >= 2
 
 
 # ---------------------------------------------------------------------------
-# Message generation
+# Message generation & sending
 # ---------------------------------------------------------------------------
 
 async def _generate_message(chat_id: int) -> str | None:
@@ -201,10 +194,12 @@ async def _generate_message(chat_id: int) -> str | None:
 async def _send(bot: Bot, chat_id: int) -> None:
     text = await _generate_message(chat_id)
     if text:
+        from aiogram.types import LinkPreviewOptions
         await bot.send_message(
             chat_id,
             f"🕵️ {escape_html(text)}",
             parse_mode="HTML",
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
         _last_sent[chat_id] = datetime.now(tz=timezone.utc)
         logger.info("Майор написал в chat=%d.", chat_id)
@@ -220,7 +215,6 @@ def _is_active_hour() -> bool:
 
 
 def _cooldown_ok(chat_id: int) -> bool:
-    """Return True if enough time has passed since the last bot message."""
     last = _last_sent.get(chat_id)
     if last is None:
         return True
@@ -228,24 +222,16 @@ def _cooldown_ok(chat_id: int) -> bool:
 
 
 async def maybe_respond(bot: Bot, chat_id: int) -> None:
-    """
-    Called after every incoming message. Fires a reactive reply if:
-    - within the allowed time window
-    - conversation is active (5+ messages, 2+ users in last N minutes)
-    - cooldown since last bot message has passed
-    - random chance check passes
-    """
+    """Reactive response during active conversations."""
     if not _is_active_hour():
         return
     if not _cooldown_ok(chat_id):
         return
     if random.random() > config.SCHEDULER_REACT_PROBABILITY:
         return
-    # Heavy check last — only query DB if everything else passes
     active = await db.run_in_thread(_check_conversation_activity, chat_id)
     if not active:
         return
-
     try:
         await _send(bot, chat_id)
     except Exception:
@@ -253,15 +239,11 @@ async def maybe_respond(bot: Bot, chat_id: int) -> None:
 
 
 async def scheduler_loop(bot: Bot) -> None:
-    """
-    Proactive loop: 2–3 initiative messages per day per chat,
-    sent at random times within the allowed window.
-    """
+    """Proactive loop: 2–3 initiative messages per day per chat."""
     logger.info("Планировщик запущен (окно %02d:00–%02d:00 МСК).", _HOUR_START, _HOUR_END)
 
     while True:
         if not _is_active_hour():
-            # Sleep until 09:00 MSK
             now_msk = datetime.now(tz=timezone.utc) + _TZ_OFFSET
             next_start = now_msk.replace(hour=_HOUR_START, minute=0, second=0, microsecond=0)
             if now_msk >= next_start:
@@ -277,9 +259,9 @@ async def scheduler_loop(bot: Bot) -> None:
                 try:
                     await _send(bot, chat_id)
                 except Exception:
-                    logger.exception("Планировщик: ошибка отправки в chat=%d.", chat_id)
+                    logger.exception("Планировщик: ошибка в chat=%d.", chat_id)
 
-        # 2–3 proactive messages per 13-hour window → interval ~3–5 hours
+        # 2–3 proactive messages per 13-hour window → ~3–5 hours between them
         interval = random.randint(180, 300) * 60
         logger.info("Планировщик: следующая инициатива через %.0f мин.", interval / 60)
         await asyncio.sleep(interval)
