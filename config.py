@@ -38,6 +38,13 @@ PROFILE_MAX_MESSAGES: int = int(os.getenv("PROFILE_MAX_MESSAGES", "500"))
 
 # Scheduler — reactive mode
 SCHEDULER_REACT_PROBABILITY: float = float(os.getenv("SCHEDULER_REACT_PROBABILITY", "0.15"))
-SCHEDULER_COOLDOWN: int = int(os.getenv("SCHEDULER_COOLDOWN", "30"))          # minutes
-SCHEDULER_ACTIVITY_WINDOW: int = int(os.getenv("SCHEDULER_ACTIVITY_WINDOW", "10"))  # minutes
+SCHEDULER_COOLDOWN: int = int(os.getenv("SCHEDULER_COOLDOWN", "30"))               # minutes
+SCHEDULER_ACTIVITY_WINDOW: int = int(os.getenv("SCHEDULER_ACTIVITY_WINDOW", "10")) # minutes
 SCHEDULER_ACTIVITY_MIN_MESSAGES: int = int(os.getenv("SCHEDULER_ACTIVITY_MIN_MESSAGES", "5"))
+
+# Scheduler — proactive mode
+# Chat is considered inactive if no messages in this many hours → skip proactive send
+SCHEDULER_INACTIVE_HOURS: int = int(os.getenv("SCHEDULER_INACTIVE_HOURS", "24"))
+
+# Mention handler — how many recent messages to include as context
+MENTION_CONTEXT_MESSAGES: int = int(os.getenv("MENTION_CONTEXT_MESSAGES", "20"))

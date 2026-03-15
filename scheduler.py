@@ -7,6 +7,7 @@ Scheduler: two modes of unprompted messages from the Major.
 
 2. PROACTIVE — a background loop that sends 2–3 initiative messages per day
    to each active chat during the allowed time window (09:00–22:00 MSK).
+   Skips chats with no messages in the last SCHEDULER_INACTIVE_HOURS hours.
 """
 
 import asyncio
@@ -15,6 +16,7 @@ import random
 from datetime import datetime, timezone, timedelta
 
 from aiogram import Bot
+from aiogram.types import LinkPreviewOptions
 from psycopg2.extras import DictCursor
 
 import config
@@ -89,9 +91,19 @@ _PROMPT_OFFENDER = (
 # ---------------------------------------------------------------------------
 
 def _fetch_active_chats() -> list[int]:
+    """
+    Return chat_ids that had at least one message in the last
+    SCHEDULER_INACTIVE_HOURS hours.
+    """
     with db.get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT DISTINCT chat_id FROM messages")
+            cur.execute(
+                """
+                SELECT DISTINCT chat_id FROM messages
+                WHERE timestamp > NOW() - %s::interval
+                """,
+                (f"{config.SCHEDULER_INACTIVE_HOURS} hours",),
+            )
             return [r[0] for r in cur.fetchall()]
 
 
@@ -194,7 +206,6 @@ async def _generate_message(chat_id: int) -> str | None:
 async def _send(bot: Bot, chat_id: int) -> None:
     text = await _generate_message(chat_id)
     if text:
-        from aiogram.types import LinkPreviewOptions
         await bot.send_message(
             chat_id,
             f"🕵️ {escape_html(text)}",
@@ -239,7 +250,7 @@ async def maybe_respond(bot: Bot, chat_id: int) -> None:
 
 
 async def scheduler_loop(bot: Bot) -> None:
-    """Proactive loop: 2–3 initiative messages per day per chat."""
+    """Proactive loop: 2–3 initiative messages per day per active chat."""
     logger.info("Планировщик запущен (окно %02d:00–%02d:00 МСК).", _HOUR_START, _HOUR_END)
 
     while True:
@@ -254,6 +265,8 @@ async def scheduler_loop(bot: Bot) -> None:
             continue
 
         chat_ids = await db.run_in_thread(_fetch_active_chats)
+        if not chat_ids:
+            logger.info("Планировщик: нет активных чатов, пропускаем.")
         for chat_id in chat_ids:
             if _cooldown_ok(chat_id):
                 try:
@@ -261,7 +274,6 @@ async def scheduler_loop(bot: Bot) -> None:
                 except Exception:
                     logger.exception("Планировщик: ошибка в chat=%d.", chat_id)
 
-        # 2–3 proactive messages per 13-hour window → ~3–5 hours between them
         interval = random.randint(180, 300) * 60
         logger.info("Планировщик: следующая инициатива через %.0f мин.", interval / 60)
         await asyncio.sleep(interval)
