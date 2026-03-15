@@ -2,25 +2,28 @@
 
 import logging
 
-from aiogram import types
+from aiogram import Bot, types
 
 import db
 
 logger = logging.getLogger(__name__)
 
+# Bot instance injected at startup — set from main.py
+_bot: Bot | None = None
+
+
+def set_bot(bot: Bot) -> None:
+    global _bot
+    _bot = bot
+
 
 def _build_display_name(user: types.User) -> str:
-    """
-    Compute the human-readable display name from Telegram user fields.
-    Priority: full name → username → ID-based fallback.
-    """
     full_name = " ".join(filter(None, [user.first_name, user.last_name])).strip()
     return full_name or user.username or f"ID{user.id}"
 
 
 def _store(chat_id: int, user: types.User, text: str) -> None:
     display_name = _build_display_name(user)
-
     with db.get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -49,7 +52,6 @@ def _store(chat_id: int, user: types.User, text: str) -> None:
 async def store_message(message: types.Message) -> None:
     if not message.text or message.text.startswith("/"):
         return
-
     user = message.from_user
     if not user:
         return
@@ -61,3 +63,9 @@ async def store_message(message: types.Message) -> None:
             "Ошибка при сохранении сообщения (chat=%d, user=%d).",
             message.chat.id, user.id,
         )
+        return
+
+    # Reactive response: try to have the Major join the conversation
+    if _bot is not None:
+        from scheduler import maybe_respond
+        await maybe_respond(_bot, message.chat.id)

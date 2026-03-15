@@ -6,11 +6,11 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 
-import config  # noqa: F401 (side-effect: validates env vars)
+import config  # noqa: F401
 
 import db
 from handlers.case import handle_case
-from handlers.message import store_message
+from handlers.message import store_message, set_bot
 from handlers.profile import handle_profile
 from handlers.stats import handle_stats
 from handlers.stats_reset import handle_stats_reset
@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=config.TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-# Command handlers (specific routes before the catch-all)
 dp.message(Command("summary"))(handle_summary)
 dp.message(Command("stats"))(handle_stats)
 dp.message(Command("case"))(handle_case)
@@ -37,7 +36,7 @@ dp.message()(store_message)
 
 async def on_startup() -> None:
     await db.init_db()
-    # Start scheduler as a background task
+    set_bot(bot)  # inject bot into message handler for reactive responses
     asyncio.create_task(scheduler_loop(bot))
     logger.info("Бот запущен.")
 

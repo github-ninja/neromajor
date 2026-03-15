@@ -36,7 +36,8 @@ SUMMARY_MAX_MESSAGES: int = int(os.getenv("SUMMARY_MAX_MESSAGES", "200"))
 # Profile
 PROFILE_MAX_MESSAGES: int = int(os.getenv("PROFILE_MAX_MESSAGES", "500"))
 
-# Scheduler: interval between messages in minutes (random within range)
-# Default: every 90–150 min → ~10 messages per 09:00–22:00 window
-SCHEDULER_INTERVAL_MIN: int = int(os.getenv("SCHEDULER_INTERVAL_MIN", "90"))
-SCHEDULER_INTERVAL_MAX: int = int(os.getenv("SCHEDULER_INTERVAL_MAX", "150"))
+# Scheduler — reactive mode
+SCHEDULER_REACT_PROBABILITY: float = float(os.getenv("SCHEDULER_REACT_PROBABILITY", "0.15"))
+SCHEDULER_COOLDOWN: int = int(os.getenv("SCHEDULER_COOLDOWN", "30"))          # minutes
+SCHEDULER_ACTIVITY_WINDOW: int = int(os.getenv("SCHEDULER_ACTIVITY_WINDOW", "10"))  # minutes
+SCHEDULER_ACTIVITY_MIN_MESSAGES: int = int(os.getenv("SCHEDULER_ACTIVITY_MIN_MESSAGES", "5"))
