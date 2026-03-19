@@ -8,7 +8,6 @@ import db
 
 logger = logging.getLogger(__name__)
 
-# Bot instance and id — injected at startup via set_bot()
 _bot: Bot | None = None
 _bot_id: int | None = None
 _bot_username: str | None = None
@@ -47,14 +46,24 @@ def _store(chat_id: int, user: types.User, text: str) -> None:
                 (user.id, user.username, user.first_name, user.last_name, display_name),
             )
             cur.execute(
-                "INSERT INTO messages (chat_id, user_id, content) VALUES (%s, %s, %s)",
+                "INSERT INTO messages (chat_id, user_id, content, is_bot) VALUES (%s, %s, %s, FALSE)",
                 (chat_id, user.id, text),
             )
         conn.commit()
 
 
+def save_bot_message(chat_id: int, bot_user_id: int, text: str) -> None:
+    """Save a bot reply into messages so it appears in conversation context."""
+    with db.get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO messages (chat_id, user_id, content, is_bot) VALUES (%s, %s, %s, TRUE)",
+                (chat_id, bot_user_id, text),
+            )
+        conn.commit()
+
+
 def _is_mention(message: types.Message) -> bool:
-    """Return True if the message mentions the bot via @username."""
     if not _bot_username or not message.entities:
         return False
     for entity in message.entities:
@@ -66,7 +75,6 @@ def _is_mention(message: types.Message) -> bool:
 
 
 def _is_reply_to_bot(message: types.Message) -> bool:
-    """Return True if the message is a reply to one of the bot's messages."""
     reply = message.reply_to_message
     return bool(reply and reply.from_user and reply.from_user.id == _bot_id)
 
@@ -93,7 +101,7 @@ async def store_message(message: types.Message) -> None:
     # Priority 1: direct mention or reply to bot — always respond
     if _is_mention(message) or _is_reply_to_bot(message):
         from handlers.mention import handle_mention
-        await handle_mention(message, _bot_id)
+        await handle_mention(message, _bot, _bot_id)
         return
 
     # Priority 2: reactive scheduler response during active conversations
