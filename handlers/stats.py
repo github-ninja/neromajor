@@ -67,6 +67,9 @@ def _calc_loyalty_index(t_count: int, t_fines: int, t_days: int, clean_days: int
     """
     Returns (loyalty_index, daily_recovery_rate).
 
+    Index is NOT clamped — can go below 0 and above 100.
+    This makes the full severity visible in the report.
+
     Penalty (severity-weighted):
       - Each violation:          -3 points
       - Each 10 000 ₽ in fines:  -1 point
@@ -78,7 +81,7 @@ def _calc_loyalty_index(t_count: int, t_fines: int, t_days: int, clean_days: int
     penalty = t_count * 3 + t_fines // 10_000 + t_days * 2
     daily_recovery = max(1, 10 - t_count // 2)
     bonus = min(50, clean_days * daily_recovery)
-    index = max(0, min(100, 100 - penalty + bonus))
+    index = 100 - penalty + bonus
     return index, daily_recovery
 
 
@@ -115,7 +118,6 @@ def _save_violations(chat_id: int, updates: dict, messages: list) -> None:
     if not updates:
         return
 
-    # display_name → user_id lookup built from the actual message list
     name_to_uid: dict[str, int] = {}
     for m in messages:
         name_to_uid.setdefault(m["display_name"], m["user_id"])
@@ -240,11 +242,8 @@ async def handle_stats(message: types.Message) -> None:
     chat_id = message.chat.id
 
     try:
-        # ── Step 1: fetch messages since last checkpoint ──────────────────
         new_msgs, start_time = await db.run_in_thread(_fetch_new_messages, chat_id)
 
-        # Checkpoint advances ONLY after successful AI processing.
-        # On any failure we return early so the same window is re-analysed next time.
         ai_ok = False
 
         if new_msgs:
@@ -285,19 +284,17 @@ async def handle_stats(message: types.Message) -> None:
 
             await db.run_in_thread(_save_violations, chat_id, updates, new_msgs)
         else:
-            ai_ok = True  # nothing to analyse, safe to advance checkpoint
+            ai_ok = True
 
         if ai_ok:
             await db.run_in_thread(_update_checkpoint, chat_id)
 
-        # ── Step 2: fetch aggregated stats ────────────────────────────────
         final_data = await db.run_in_thread(_fetch_all_stats, chat_id)
 
         if not final_data:
             await status_msg.edit_text("✅ Нарушений не зафиксировано.")
             return
 
-        # ── Step 3: build report ──────────────────────────────────────────
         if start_time.tzinfo is None:
             start_time = start_time.replace(tzinfo=timezone.utc)
         window_str = start_time.strftime("%d.%m.%Y %H:%M")
@@ -308,7 +305,16 @@ async def handle_stats(message: types.Message) -> None:
         ]
 
         for p in final_data:
-            icon = "🟢" if p["t"]["i"] >= 80 else "🟡" if p["t"]["i"] >= 40 else "🔴"
+            idx = p["t"]["i"]
+            if idx >= 80:
+                icon = "🟢"
+            elif idx >= 40:
+                icon = "🟡"
+            elif idx >= 0:
+                icon = "🔴"
+            else:
+                icon = "💀"
+
             lines.append(f"\n{icon} <b>{escape_html(p['name'])}</b>")
 
             if p["d"]["c"] > 0:
@@ -327,16 +333,15 @@ async def handle_stats(message: types.Message) -> None:
                 f"   └ Штраф: <code>{p['t']['f']} ₽</code> | Срок: <code>{p['t']['d']} дн.</code>"
             )
 
-            if p["t"]["clean"] > 0 and p["t"]["i"] < 100:
+            if p["t"]["clean"] > 0 and idx < 100:
                 bonus = min(50, p["t"]["clean"] * p["t"]["rate"])
                 lines.append(
                     f"   └ 🧼 Без нарушений: <code>{p['t']['clean']} дн.</code> "
                     f"(+{p['t']['rate']} пт/день, бонус: +{bonus})"
                 )
 
-            lines.append(f"   ┗ <b>Индекс патриотичности:</b> <code>{p['t']['i']}%</code>")
+            lines.append(f"   ┗ <b>Индекс патриотичности:</b> <code>{idx}%</code>")
 
-        # ── Step 4: AI closing remark ─────────────────────────────────────
         target = random.choice(final_data)
         if target["d"]["c"] > 0:
             context = (
