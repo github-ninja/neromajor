@@ -1,15 +1,64 @@
-"""Shared handler plumbing: status placeholder, multi-part replies, target resolution."""
+"""Shared handler plumbing: status placeholder, typing animation, target resolution."""
 
+import asyncio
+import itertools
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
 from aiogram import types
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.filters import CommandObject
 
 from bot.db.repo import Repository, UserRef
 
 logger = logging.getLogger(__name__)
+
+TYPING_FRAMES = ("✍️ <i>Печатает.</i>", "✍️ <i>Печатает..</i>", "✍️ <i>Печатает...</i>")
+TYPING = TYPING_FRAMES[0]
+# Each frame is a message edit; Telegram rate-limits edits per chat.
+FRAME_INTERVAL = 3.0
+
+Edit = Callable[[str], Awaitable[object]]
+
+
+@asynccontextmanager
+async def typing(edit: Edit) -> AsyncIterator[None]:
+    """
+    Animate a placeholder already showing TYPING while the body runs. The
+    current frame edit is never cancelled, only awaited: a cancelled request
+    may still reach Telegram after the real answer and overwrite it.
+    """
+    stop = asyncio.Event()
+
+    async def animate() -> None:
+        for frame in itertools.cycle(TYPING_FRAMES[1:] + TYPING_FRAMES[:1]):
+            try:
+                await asyncio.wait_for(stop.wait(), FRAME_INTERVAL)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await edit(frame)
+            except TelegramAPIError as exc:
+                logger.debug("Анимация остановлена: %s", exc)
+                return
+
+    task = asyncio.create_task(animate())
+    try:
+        yield
+    finally:
+        stop.set()
+        await task
+
+
+async def replace_placeholder(edit: Edit, text: str) -> None:
+    """Final edit: survives one flood-control pause, which animation may have caused."""
+    try:
+        await edit(text)
+    except TelegramRetryAfter as exc:
+        await asyncio.sleep(exc.retry_after)
+        await edit(text)
 
 
 class Status:

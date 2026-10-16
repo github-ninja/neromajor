@@ -4,8 +4,8 @@ otherwise let the Major decide whether to chime in. Must be the last router.
 """
 
 import logging
-import random
 import time
+from datetime import datetime
 
 from aiogram import Bot, F, Router, types
 from aiogram.enums import ChatType
@@ -14,6 +14,7 @@ from bot.ai import prompts, voice
 from bot.ai.gemini import AIError, Gemini
 from bot.config import Settings
 from bot.db.repo import Repository
+from bot.handlers.common import TYPING, replace_placeholder, typing
 from bot.services.major import Major
 from bot.tg import display_name, escape
 
@@ -68,28 +69,34 @@ async def _answer(
     message: types.Message, bot_id: int, text: str, repo: Repository, ai: Gemini, settings: Settings
 ) -> None:
     name = display_name(message.from_user)
+    today = f"{datetime.now(settings.timezone):%d.%m.%Y}"
     context = _format_dialogue(
         await repo.recent_dialogue(message.chat.id, settings.mention_context_messages)
     )
     reply = message.reply_to_message
     if reply and reply.from_user and reply.from_user.id == bot_id:
         prompt = prompts.MENTION_REPLY.format(
-            bot_name=voice.BOT_NAME, context=context, name=name,
+            today=today, bot_name=voice.BOT_NAME, context=context, name=name,
             quoted=(reply.text or reply.caption or "")[:_QUOTE_CHARS], text=text[:_TEXT_CHARS],
         )
     else:
         prompt = prompts.MENTION_DIRECT.format(
-            bot_name=voice.BOT_NAME, context=context, name=name, text=text[:_TEXT_CHARS],
+            today=today, bot_name=voice.BOT_NAME, context=context, name=name, text=text[:_TEXT_CHARS],
         )
 
-    try:
-        answer = await ai.text(prompt, system=voice.CONVERSATION_PERSONA)
-    except AIError as exc:
-        logger.warning("ИИ недоступен для ответа на упоминание (chat=%d): %s",
-                       message.chat.id, exc.user_message)
-        answer = random.choice(voice.FALLBACK_REPLIES)
-    sent = await message.reply(escape(answer))
-    await repo.save_bot_message(message.chat.id, bot_id, answer, sent.message_id)
+    placeholder = await message.reply(TYPING)
+    async with typing(placeholder.edit_text):
+        try:
+            answer = await ai.text(
+                prompt, system=voice.CONVERSATION_PERSONA,
+                deadline=settings.gemini_reply_deadline,
+            )
+        except AIError as exc:
+            logger.warning("ИИ недоступен для ответа на упоминание (chat=%d): %s",
+                           message.chat.id, exc.user_message)
+            answer = voice.fallback_reply(exc)
+    await replace_placeholder(placeholder.edit_text, escape(answer))
+    await repo.save_bot_message(message.chat.id, bot_id, answer, placeholder.message_id)
 
 
 @router.message(F.text | F.caption)

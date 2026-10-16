@@ -13,6 +13,7 @@ from aiogram.types import Chat, Message, SentGuestMessage, Update, User
 from bot.config import Settings
 from bot.db.repo import OffenderStats, UserRef
 from bot.handlers import build_router
+from bot.handlers.common import TYPING
 from bot.handlers.messages import MentionLimiter
 from bot.services.audit import AuditOutcome
 
@@ -76,7 +77,11 @@ class FakeRepo:
 
 
 class FakeAI:
-    async def text(self, prompt, *, system=None):
+    def __init__(self):
+        self.calls = []
+
+    async def text(self, prompt, **kwargs):
+        self.calls.append((prompt, kwargs))
         return "Всё записано <в дело>."
 
 
@@ -149,8 +154,12 @@ async def test_mention_with_emoji_prefix_gets_reply_once_per_cooldown(env):
     entity = {"type": "mention", "offset": 3, "length": 15}
     await dp.feed_update(bot, update(text, entities=[entity], uid=1))
     await dp.feed_update(bot, update(text, entities=[entity], uid=2))
-    assert texts(session) == ["Всё записано &lt;в дело&gt;."]
+    # Placeholder at once, then edited into the answer; the second mention is throttled.
+    assert texts(session) == [TYPING, "Всё записано &lt;в дело&gt;."]
+    assert isinstance(session.sent[-1], EditMessageText)
     assert len(repo.bot_saved) == 1 and major.reacted == []
+    [(prompt, _)] = dp.workflow_data["ai"].calls
+    assert "Сегодня " in prompt
 
 
 @pytest.mark.asyncio
@@ -169,14 +178,14 @@ async def test_mention_gets_canned_reply_when_ai_is_down(env):
     dp, bot, session, repo, _ = env
 
     class DownAI:
-        async def text(self, prompt, *, system=None):
+        async def text(self, prompt, **kwargs):
             raise AIRateLimited("лимит")
 
     dp.workflow_data["ai"] = DownAI()
     text = "@neuromajor_bot ау"
     await dp.feed_update(bot, update(text, entities=[{"type": "mention", "offset": 0, "length": 15}]))
-    [reply] = texts(session)
-    assert reply in voice.FALLBACK_REPLIES
+    placeholder, reply = texts(session)
+    assert placeholder == TYPING and reply in voice.FALLBACK_REPLIES["rate_limited"]
     assert len(repo.bot_saved) == 1
 
 
@@ -188,7 +197,7 @@ async def test_guest_call_gets_canned_reply_when_ai_is_down(env):
     dp, bot, session, repo, _ = env
 
     class DownAI:
-        async def text(self, prompt, *, system=None):
+        async def text(self, prompt, **kwargs):
             raise AIError("location not supported")
 
     dp.workflow_data["ai"] = DownAI()
@@ -198,5 +207,7 @@ async def test_guest_call_gets_canned_reply_when_ai_is_down(env):
     await dp.feed_update(bot, Update(update_id=50, guest_message=msg))
     [answer] = [m for m in session.sent if isinstance(m, AnswerGuestQuery)]
     assert answer.guest_query_id == "q1"
-    assert answer.result.input_message_content.message_text in voice.FALLBACK_REPLIES
+    assert answer.result.input_message_content.message_text == TYPING
+    [edit] = [m for m in session.sent if isinstance(m, EditMessageText)]
+    assert edit.inline_message_id == "x" and edit.text in voice.FALLBACK_REPLIES["error"]
     assert repo.saved == []  # foreign chats are never stored

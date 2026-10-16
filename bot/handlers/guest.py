@@ -1,13 +1,15 @@
 """Guest mode: the bot is @mentioned in a chat it isn't a member of."""
 
 import logging
-import random
+from datetime import datetime
 
-from aiogram import Router
+from aiogram import Bot, Router
 from aiogram.types import InlineQueryResultArticle, InputTextMessageContent, Message
 
 from bot.ai import prompts, voice
 from bot.ai.gemini import AIError, Gemini
+from bot.config import Settings
+from bot.handlers.common import TYPING, replace_placeholder, typing
 from bot.tg import display_name, escape
 
 logger = logging.getLogger(__name__)
@@ -15,10 +17,13 @@ router = Router(name="guest")
 
 
 @router.guest_message()
-async def handle_guest_message(message: Message, ai: Gemini) -> None:
+async def handle_guest_message(
+    message: Message, bot: Bot, ai: Gemini, settings: Settings
+) -> None:
     """
-    Stateless: no history is stored for foreign chats, and Telegram accepts
-    exactly one answer per guest_query_id.
+    Stateless: no history is stored for foreign chats. Telegram accepts
+    exactly one answer per guest_query_id, so the answer is the typing
+    placeholder, sent at once and then edited as an inline message.
     """
     if not message.guest_query_id:
         return
@@ -35,22 +40,31 @@ async def handle_guest_message(message: Message, ai: Gemini) -> None:
         reply_context = prompts.GUEST_REPLY_CONTEXT.format(quoted=quoted)
 
     prompt = prompts.GUEST.format(
+        today=f"{datetime.now(settings.timezone):%d.%m.%Y}",
         name=display_name(user),
         text=(message.text or message.caption or "").strip()[:1000],
         reply_context=reply_context,
     )
-    try:
-        answer = await ai.text(prompt, system=voice.CONVERSATION_PERSONA)
-    except AIError as exc:
-        logger.warning("ИИ недоступен для гостевого вызова (%s): %s",
-                       message.guest_query_id, exc.user_message)
-        answer = random.choice(voice.FALLBACK_REPLIES)
-
-    await message.answer_guest_query(
+    sent = await message.answer_guest_query(
         result=InlineQueryResultArticle(
             id="reply",
             title=voice.BOT_NAME,
-            input_message_content=InputTextMessageContent(message_text=escape(answer)),
+            input_message_content=InputTextMessageContent(message_text=TYPING),
         ),
     )
+
+    async def edit(text: str) -> object:
+        return await bot.edit_message_text(text, inline_message_id=sent.inline_message_id)
+
+    async with typing(edit):
+        try:
+            answer = await ai.text(
+                prompt, system=voice.CONVERSATION_PERSONA,
+                deadline=settings.gemini_reply_deadline,
+            )
+        except AIError as exc:
+            logger.warning("ИИ недоступен для гостевого вызова (%s): %s",
+                           message.guest_query_id, exc.user_message)
+            answer = voice.fallback_reply(exc)
+    await replace_placeholder(edit, escape(answer))
     logger.info("Майор ответил на гостевой вызов (guest_query_id=%s).", message.guest_query_id)

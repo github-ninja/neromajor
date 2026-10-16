@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 from types import SimpleNamespace
 
@@ -5,7 +6,7 @@ import pytest
 from google.genai import errors
 
 from bot.ai import gemini as gemini_mod
-from bot.ai.gemini import AIContentError, AIError, AIRateLimited, Gemini
+from bot.ai.gemini import AIContentError, AIError, AIRateLimited, AITimeout, Gemini
 from bot.config import Settings
 
 
@@ -100,10 +101,10 @@ async def test_spending_cap_fails_fast_and_pauses_further_calls(make):
 @pytest.mark.asyncio
 async def test_main_model_falls_back_to_lite_when_overloaded(make):
     busy = api_error(503, "This model is currently experiencing high demand.")
-    g, calls = make([busy, busy, ok("попроще")], fallback=True)
+    g, calls = make([busy, ok("попроще")], fallback=True)
     assert await g.text("x") == "попроще"
     models = [c["model"] for c in calls]
-    assert models == [g._settings.gemini_model] * 2 + [g._settings.gemini_lite_model]
+    assert models == [g._settings.gemini_model, g._settings.gemini_lite_model]
 
 
 @pytest.mark.asyncio
@@ -120,3 +121,63 @@ async def test_quota_pause_is_per_model(make):
     assert await g.text("x") == "lite"  # main capped -> fallback
     assert await g.text("y") == "lite again"  # main paused: straight to lite
     assert [c["model"] for c in calls] == [g._settings.gemini_model] + [g._settings.gemini_lite_model] * 2
+
+
+@pytest.mark.asyncio
+async def test_deadline_bounds_the_whole_call(make):
+    g, calls = make([])
+
+    async def hang(**kwargs):
+        calls.append(kwargs)
+        await asyncio.Event().wait()
+
+    g._client.aio.models.generate_content = hang
+    with pytest.raises(AITimeout):
+        await g.text("x", deadline=0.05)
+    assert len(calls) == 1
+
+
+BILLING_429 = "You exceeded your current quota, please check your plan and billing details."
+
+
+
+
+
+
+def test_retry_delay_from_message_hint():
+    exc = api_error(429, "Quota exceeded for metric: free_tier_requests, limit: 20\nPlease retry in 14h53m22.85s.")
+    assert gemini_mod._retry_delay(exc) == pytest.approx(14 * 3600 + 53 * 60 + 22.85)
+
+
+@pytest.mark.asyncio
+async def test_daily_quota_pauses_until_reset(make):
+    daily = api_error(429, "Quota exceeded, limit: 20\nPlease retry in 2h0m0s.")
+    g, _ = make([daily])
+    with pytest.raises(AIRateLimited):
+        await g.text("x")
+    left = g._paused_until[g._settings.gemini_lite_model] - gemini_mod.time.monotonic()
+    assert 7000 < left <= 7200
+
+
+@pytest.mark.asyncio
+async def test_per_minute_429_mentioning_billing_is_still_retried(make):
+    retry = [{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "20s"}]
+    g, calls = make([api_error(429, BILLING_429, retry), ok()])
+    assert await g.text("x") == "ответ" and len(calls) == 2
+    assert not g._paused_until
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_is_per_model(make, monkeypatch):
+    waits = []
+
+    async def record_sleep(delay):
+        waits.append(delay)
+
+    monkeypatch.setattr(gemini_mod.asyncio, "sleep", record_sleep)
+    busy = api_error(503, "This model is currently experiencing high demand.")
+    g, calls = make([busy, ok()], fallback=True)
+    g._settings = dataclasses.replace(g._settings, gemini_rpm=10)  # 6 s between starts
+    assert await g.text("x") == "ответ"
+    assert [c["model"] for c in calls] == [g._settings.gemini_model, g._settings.gemini_lite_model]
+    assert waits == []  # the fallback model has its own, still empty, schedule

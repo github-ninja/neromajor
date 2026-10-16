@@ -105,6 +105,7 @@ async def handle_stats(
                     recent,
                 ),
                 system=voice.PERSONA,
+                deadline=settings.gemini_reply_deadline,
             )
         except AIError:
             opinion = "Майор временно недоступен. Подождите минуту."

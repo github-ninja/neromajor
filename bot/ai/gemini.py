@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import Awaitable
 from typing import Any, TypeVar
 
 from google import genai
@@ -16,6 +17,7 @@ from bot.config import Settings
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
+R = TypeVar("R")
 
 # A 429 asking us to wait longer than this is a daily/hard quota, not a burst
 # limit: retrying would only burn the remaining attempts.
@@ -34,6 +36,10 @@ class AIError(Exception):
 
 
 class AIRateLimited(AIError):
+    pass
+
+
+class AITimeout(AIError):
     pass
 
 
@@ -61,28 +67,37 @@ class _RateLimiter:
 
 
 def _retry_delay(exc: genai_errors.APIError) -> float | None:
-    """Extract google.rpc.RetryInfo.retryDelay (e.g. "37s") from a 429 payload."""
+    """
+    google.rpc.RetryInfo.retryDelay (e.g. "37s") from a 429 payload, else the
+    "Please retry in 14h53m22.8s" hint in the message.
+    """
     details = exc.details
     if isinstance(details, dict):
         details = details.get("error", details).get("details", [])
-    if not isinstance(details, list):
-        return None
-    for item in details:
+    for item in details if isinstance(details, list) else []:
         if isinstance(item, dict) and str(item.get("@type", "")).endswith("RetryInfo"):
             match = re.match(r"([\d.]+)s", str(item.get("retryDelay", "")))
             if match:
                 return float(match.group(1))
+    match = re.search(r"retry in (?:(\d+)h)?(?:(\d+)m(?!s))?(?:([\d.]+)s)?", exc.message or "")
+    if match and any(match.groups()):
+        h, m, s = match.groups()
+        return int(h or 0) * 3600 + int(m or 0) * 60 + float(s or 0)
     return None
 
 
-def _is_hard_quota(exc: genai_errors.APIError) -> bool:
-    """Quota that won't recover within a retry: per-day limits, spending cap, billing."""
+def _is_hard_quota(exc: genai_errors.APIError, delay: float | None) -> bool:
+    """
+    Quota that won't recover within a retry: per-day limits, spending cap.
+    Every quota 429 says "check your plan and billing details", so that text
+    only counts when the API gives no retry delay to go by.
+    """
     text = f"{exc.message} {exc.details}".lower()
-    return (
-        "perday" in text.replace("_", "")
-        or "spending cap" in text
-        or "billing" in text
-    )
+    if "perday" in text.replace("_", "") or "spending cap" in text:
+        return True
+    if delay is not None:
+        return delay > _MAX_RETRY_DELAY
+    return "billing" in text
 
 
 def _is_transient(exc: genai_errors.APIError) -> bool:
@@ -95,7 +110,9 @@ class Gemini:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._client = genai.Client(api_key=settings.gemini_api_key)
-        self._limiter = _RateLimiter(settings.gemini_rpm)
+        # Per model, like Google's quotas: falling back to the lite model must
+        # not queue behind the main model's request that just failed.
+        self._limiters: dict[str, _RateLimiter] = {}
         # Quotas are per model, so is the pause after exhausting one.
         self._paused_until: dict[str, float] = {}
 
@@ -107,15 +124,17 @@ class Gemini:
             )
         return genai_types.GenerateContentConfig(**kwargs)
 
-    async def text(self, prompt: str, *, system: str | None = None, lite: bool = False) -> str:
-        response = await self._generate_routed(prompt, self._config(system), lite)
-        return response.text.strip()
-
-    async def text_with_search(self, prompt: str, *, system: str | None = None) -> str:
-        config = self._config(
-            system, tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())]
-        )
-        response = await self._generate(prompt, config, self._settings.gemini_search_model)
+    async def text(
+        self,
+        prompt: str,
+        *,
+        system: str | None = None,
+        lite: bool = False,
+        deadline: float | None = None,
+    ) -> str:
+        """*deadline*: give up after this many seconds in total, retries included."""
+        call = self._generate_routed(prompt, self._config(system), lite)
+        response = await self._within(deadline, call)
         return response.text.strip()
 
     async def structured(
@@ -133,6 +152,16 @@ class Gemini:
             logger.warning("Gemini вернул ответ не по схеме %s: %s", schema.__name__, exc)
             raise AIContentError("ИИ вернул некорректный формат ответа.") from exc
 
+    @staticmethod
+    async def _within(deadline: float | None, call: Awaitable[R]) -> R:
+        if deadline is None:
+            return await call
+        try:
+            return await asyncio.wait_for(call, timeout=deadline)
+        except asyncio.TimeoutError:
+            logger.warning("Gemini: ответ не уложился в %.0f с.", deadline)
+            raise AITimeout("ИИ не успел ответить.") from None
+
     async def _generate_routed(
         self, prompt: str, config: genai_types.GenerateContentConfig, lite: bool
     ) -> genai_types.GenerateContentResponse:
@@ -145,8 +174,9 @@ class Gemini:
         if lite or main == fallback:
             return await self._generate(prompt, config, fallback, self._settings.gemini_retries)
         try:
-            # Few attempts on the main model: the fallback is better than a long wait.
-            return await self._generate(prompt, config, main, min(2, self._settings.gemini_retries))
+            # One attempt: overload ("high demand" 503) is model-wide and
+            # usually outlasts a retry, so the fallback is the retry.
+            return await self._generate(prompt, config, main, 1)
         except AIContentError:
             raise
         except AIError as exc:
@@ -161,7 +191,8 @@ class Gemini:
             raise AIRateLimited("Лимит запросов к ИИ исчерпан. Попробуйте позже.")
         for attempt in range(1, retries + 1):
             last = attempt == retries
-            await self._limiter.acquire()
+            limiter = self._limiters.setdefault(model, _RateLimiter(self._settings.gemini_rpm))
+            await limiter.acquire()
             logger.info(
                 "Gemini [%s] попытка %d/%d, промпт %d симв.", model, attempt, retries, len(prompt)
             )
@@ -175,20 +206,23 @@ class Gemini:
             except asyncio.TimeoutError:
                 logger.warning("Gemini таймаут (попытка %d/%d).", attempt, retries)
                 if last:
-                    raise AIError("Превышено время ожидания ответа от ИИ.") from None
+                    raise AITimeout("Превышено время ожидания ответа от ИИ.") from None
                 await asyncio.sleep(2 ** attempt)
                 continue
             except genai_errors.APIError as exc:
                 if exc.code == 429:
-                    delay = _retry_delay(exc) or 10.0 * attempt
+                    hinted = _retry_delay(exc)
+                    delay = hinted or 10.0 * attempt
                     logger.warning("Gemini 429 (попытка %d/%d, ждать %.0f с): %s",
                                    attempt, retries, delay, exc.message)
-                    hard = _is_hard_quota(exc)
+                    hard = _is_hard_quota(exc, hinted)
                     if hard:
-                        self._paused_until[model] = time.monotonic() + _HARD_QUOTA_PAUSE
+                        # Wait as long as the API says, e.g. until the daily reset.
+                        pause = max(_HARD_QUOTA_PAUSE, int(delay) if delay > _MAX_RETRY_DELAY else 0)
+                        self._paused_until[model] = time.monotonic() + pause
                         logger.error("Gemini [%s]: квота исчерпана, пауза %d мин: %s",
-                                     model, _HARD_QUOTA_PAUSE // 60, exc.message)
-                    if hard or last or delay > _MAX_RETRY_DELAY:
+                                     model, pause // 60, exc.message)
+                    if hard or last:
                         raise AIRateLimited(
                             "Достигнут лимит запросов к ИИ. Попробуйте позже."
                         ) from exc

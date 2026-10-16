@@ -50,13 +50,14 @@ class Settings:
     gemini_api_key: str
     gemini_model: str  # everything the Major says
     gemini_lite_model: str  # bulk audit, and fallback when the main model is unavailable
-    gemini_search_model: str
     # None = model default. Sampling parameters are deliberately absent:
     # Gemini ignores them since 3.6 and upcoming models reject them.
     gemini_thinking_level: str | None
     gemini_timeout: float
     gemini_retries: int
-    gemini_rpm: int  # client-side cap on requests per minute (free tier friendly)
+    gemini_rpm: int  # client-side cap on requests per minute per model (free tier friendly)
+    # Total time a conversational reply may take before a canned one is sent.
+    gemini_reply_deadline: float
 
     timezone: ZoneInfo
     active_hour_start: int
@@ -108,11 +109,11 @@ class Settings:
             gemini_api_key=_str("GEMINI_API_KEY"),
             gemini_model=_str("GEMINI_MODEL", "gemini-3.8-flash"),
             gemini_lite_model=_str("GEMINI_LITE_MODEL", "gemini-3.1-flash-lite"),
-            gemini_search_model=_str("GEMINI_SEARCH_MODEL", "gemini-3.6-flash"),
             gemini_thinking_level=thinking,
             gemini_timeout=_float("GEMINI_TIMEOUT", 90.0, minimum=1.0),
             gemini_retries=_int("GEMINI_RETRIES", 4, minimum=1),
             gemini_rpm=_int("GEMINI_RPM", 10, minimum=1),
+            gemini_reply_deadline=_float("GEMINI_REPLY_DEADLINE", 25.0, minimum=1.0),
             timezone=ZoneInfo(_str("BOT_TIMEZONE", "Europe/Moscow")),
             active_hour_start=start,
             active_hour_end=end,
