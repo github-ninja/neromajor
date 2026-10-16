@@ -157,3 +157,22 @@ async def test_commands_are_not_stored(env):
     await dp.feed_update(bot, update("/case @nobody"))
     assert repo.saved == []
     assert "отсутствует" in texts(session)[-1]
+
+
+@pytest.mark.asyncio
+async def test_mention_gets_canned_reply_when_ai_is_down(env):
+    from bot.ai import voice
+    from bot.ai.gemini import AIRateLimited
+
+    dp, bot, session, repo, _ = env
+
+    class DownAI:
+        async def text(self, prompt, *, system=None):
+            raise AIRateLimited("лимит")
+
+    dp.workflow_data["ai"] = DownAI()
+    text = "@neuromajor_bot ау"
+    await dp.feed_update(bot, update(text, entities=[{"type": "mention", "offset": 0, "length": 15}]))
+    [reply] = texts(session)
+    assert reply in voice.FALLBACK_REPLIES
+    assert len(repo.bot_saved) == 1

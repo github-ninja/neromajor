@@ -20,6 +20,9 @@ T = TypeVar("T", bound=BaseModel)
 # A 429 asking us to wait longer than this is a daily/hard quota, not a burst
 # limit: retrying would only burn the remaining attempts.
 _MAX_RETRY_DELAY = 65.0
+# After a hard quota error (daily quota, project spending cap) every call
+# fails fast for this long instead of hitting the API again.
+_HARD_QUOTA_PAUSE = 15 * 60
 
 
 class AIError(Exception):
@@ -72,8 +75,14 @@ def _retry_delay(exc: genai_errors.APIError) -> float | None:
     return None
 
 
-def _is_daily_quota(exc: genai_errors.APIError) -> bool:
-    return "perday" in str(exc.details).lower().replace("_", "")
+def _is_hard_quota(exc: genai_errors.APIError) -> bool:
+    """Quota that won't recover within a retry: per-day limits, spending cap, billing."""
+    text = f"{exc.message} {exc.details}".lower()
+    return (
+        "perday" in text.replace("_", "")
+        or "spending cap" in text
+        or "billing" in text
+    )
 
 
 def _is_transient(exc: genai_errors.APIError) -> bool:
@@ -87,6 +96,7 @@ class Gemini:
         self._settings = settings
         self._client = genai.Client(api_key=settings.gemini_api_key)
         self._limiter = _RateLimiter(settings.gemini_rpm)
+        self._paused_until = 0.0
 
     def _config(self, system: str | None, **extra: Any) -> genai_types.GenerateContentConfig:
         kwargs: dict[str, Any] = {"system_instruction": system, **extra}
@@ -123,6 +133,8 @@ class Gemini:
     async def _generate(
         self, prompt: str, config: genai_types.GenerateContentConfig, model: str
     ) -> genai_types.GenerateContentResponse:
+        if time.monotonic() < self._paused_until:
+            raise AIRateLimited("Лимит запросов к ИИ исчерпан. Попробуйте позже.")
         retries = self._settings.gemini_retries
         for attempt in range(1, retries + 1):
             last = attempt == retries
@@ -148,7 +160,12 @@ class Gemini:
                     delay = _retry_delay(exc) or 10.0 * attempt
                     logger.warning("Gemini 429 (попытка %d/%d, ждать %.0f с): %s",
                                    attempt, retries, delay, exc.message)
-                    if last or delay > _MAX_RETRY_DELAY or _is_daily_quota(exc):
+                    hard = _is_hard_quota(exc)
+                    if hard:
+                        self._paused_until = time.monotonic() + _HARD_QUOTA_PAUSE
+                        logger.error("Gemini: квота исчерпана, пауза %d мин: %s",
+                                     _HARD_QUOTA_PAUSE // 60, exc.message)
+                    if hard or last or delay > _MAX_RETRY_DELAY:
                         raise AIRateLimited(
                             "Достигнут лимит запросов к ИИ. Попробуйте позже."
                         ) from exc

@@ -82,3 +82,14 @@ async def test_empty_answer_is_content_error(make):
     g, _ = make([ok("")])
     with pytest.raises(AIContentError):
         await g.text("x")
+
+
+@pytest.mark.asyncio
+async def test_spending_cap_fails_fast_and_pauses_further_calls(make):
+    cap = api_error(429, "Your project has exceeded its monthly spending cap. Please go to AI Studio")
+    g, calls = make([cap, ok()])
+    with pytest.raises(AIRateLimited):
+        await g.text("x")
+    with pytest.raises(AIRateLimited):
+        await g.text("y")  # paused: no request is sent at all
+    assert len(calls) == 1

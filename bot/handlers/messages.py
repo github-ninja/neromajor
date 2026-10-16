@@ -4,6 +4,7 @@ otherwise let the Major decide whether to chime in. Must be the last router.
 """
 
 import logging
+import random
 import time
 
 from aiogram import Bot, F, Router, types
@@ -84,9 +85,9 @@ async def _answer(
     try:
         answer = await ai.text(prompt, system=voice.PERSONA)
     except AIError as exc:
-        logger.warning("Ответ на упоминание пропущен (chat=%d): %s",
+        logger.warning("ИИ недоступен для ответа на упоминание (chat=%d): %s",
                        message.chat.id, exc.user_message)
-        return
+        answer = random.choice(voice.FALLBACK_REPLIES)
     sent = await message.reply(escape(answer))
     await repo.save_bot_message(message.chat.id, bot_id, answer, sent.message_id)
 
