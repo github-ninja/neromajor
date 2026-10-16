@@ -1,0 +1,4 @@
+*
+!requirements.txt
+!bot/
+**/__pycache__

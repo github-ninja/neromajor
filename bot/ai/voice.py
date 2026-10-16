@@ -1,17 +1,27 @@
 """
-Shared "Major's voice" randomisation pool.
+The Major's voice: persona plus randomised "mood seeds".
 
 Gemini converges on the same phrasing for the same prompt (sampling
-parameters are fixed by the API and can't be tuned). We break that by injecting randomised "mood seeds" into any prompt
-that asks the Major to speak in his own voice — the scheduler's proactive
-remarks, the /stats "ОСОБОЕ МНЕНИЕ" line, and the /summary verdict.
+parameters are fixed by the API and can't be tuned), so every prompt where
+the Major speaks in his own voice gets a random circumstance / rhetorical
+device / shape, plus the list of his recent remarks to avoid.
 
-Everything here is voice-level only. Analytical prompts (classification,
-JSON audits, psychological profiling) must NOT use this module — mixing
-creative randomness into analytical paths pollutes the output.
+Voice-level only. Analytical prompts (audit, profiling, summary JSON) must
+not use this module — creative randomness pollutes analytical output.
 """
 
 import random
+
+BOT_NAME = "Товарищ Майор"
+
+PERSONA = (
+    "Ты — майор ФСБ, «Товарищ Майор», ведущий негласное наблюдение за чатом. "
+    "Говоришь в духе советского следователя: сарказм, пассивная агрессия, "
+    "холодная ирония, налёт угрозы. Никаких приветствий, обращений «Дорогие граждане», "
+    "никаких вопросов, никаких звёздочек и markdown-разметки, никаких префиксов "
+    f"вроде «{BOT_NAME}:» и эмодзи в начале. "
+    "Пиши от первого лица как живую мысль, а не лозунг."
+)
 
 # Where the thought comes from — grounds the remark in a specific imagined
 # moment so the output isn't abstract sloganeering.
@@ -57,34 +67,32 @@ _SHAPES = [
 ]
 
 
-PERSONA = (
-    "Ты — майор ФСБ, «Товарищ Майор», ведущий негласное наблюдение за чатом. "
-    "Говоришь в духе советского следователя: сарказм, пассивная агрессия, "
-    "холодная ирония, налёт угрозы. Никаких приветствий, обращений «Дорогие граждане», "
-    "никаких вопросов, никаких звёздочек и markdown-разметки. "
-    "Пиши от первого лица как живую мысль, а не лозунг."
-)
-
-
-def mood_block() -> str:
-    """Return a randomised Обстоятельства/Приём/Форма triple to seed a prompt."""
+def mood_block(rng: random.Random | None = None) -> str:
+    rng = rng or random
     return (
-        f"Обстоятельства: {random.choice(_MOODS)}.\n"
-        f"Приём: действуй {random.choice(_DEVICES)}.\n"
-        f"Форма: {random.choice(_SHAPES)}."
+        f"Обстоятельства: {rng.choice(_MOODS)}.\n"
+        f"Приём: действуй {rng.choice(_DEVICES)}.\n"
+        f"Форма: {rng.choice(_SHAPES)}."
     )
 
 
 def no_repeat_block(recent: list[str]) -> str:
-    """
-    Tell the model what it has already said so it doesn't rephrase itself.
-    Returns empty string if there's no history to compare against.
-    """
     if not recent:
         return ""
     quoted = "\n".join(f"— {line}" for line in recent)
     return (
-        "\nТвои недавние реплики (НЕ повторяй их ни дословно, ни по смыслу, "
+        "Твои недавние реплики (НЕ повторяй их ни дословно, ни по смыслу, "
         "не используй те же ключевые слова и обороты):\n"
-        f"{quoted}\n"
+        f"{quoted}\n\n"
+    )
+
+
+def remark_prompt(task: str, recent: list[str] | None = None, *, with_mood: bool = True) -> str:
+    """User prompt for a one-off remark; pair with system=PERSONA."""
+    mood = f"{mood_block()}\n\n" if with_mood else ""
+    return (
+        f"{mood}"
+        f"Задача: {task}\n\n"
+        f"{no_repeat_block(recent or [])}"
+        "Выдай ровно одну реплику, без пояснений и вариантов."
     )
