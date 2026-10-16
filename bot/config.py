@@ -114,7 +114,7 @@ class Settings:
             timezone=ZoneInfo(_str("BOT_TIMEZONE", "Europe/Moscow")),
             active_hour_start=start,
             active_hour_end=end,
-            audit_interval=_int("AUDIT_INTERVAL", 60, minimum=1),
+            audit_interval=_int("AUDIT_INTERVAL", 360, minimum=1),
             audit_batch_messages=_int("AUDIT_BATCH_MESSAGES", 400, minimum=1),
             audit_batch_chars=_int("AUDIT_BATCH_CHARS", 30_000, minimum=1000),
             audit_daily_requests=_int("AUDIT_DAILY_REQUESTS", 40),
