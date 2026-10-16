@@ -96,7 +96,8 @@ class Gemini:
         self._settings = settings
         self._client = genai.Client(api_key=settings.gemini_api_key)
         self._limiter = _RateLimiter(settings.gemini_rpm)
-        self._paused_until = 0.0
+        # Quotas are per model, so is the pause after exhausting one.
+        self._paused_until: dict[str, float] = {}
 
     def _config(self, system: str | None, **extra: Any) -> genai_types.GenerateContentConfig:
         kwargs: dict[str, Any] = {"system_instruction": system, **extra}
@@ -106,8 +107,8 @@ class Gemini:
             )
         return genai_types.GenerateContentConfig(**kwargs)
 
-    async def text(self, prompt: str, *, system: str | None = None) -> str:
-        response = await self._generate(prompt, self._config(system), self._settings.gemini_model)
+    async def text(self, prompt: str, *, system: str | None = None, lite: bool = False) -> str:
+        response = await self._generate_routed(prompt, self._config(system), lite)
         return response.text.strip()
 
     async def text_with_search(self, prompt: str, *, system: str | None = None) -> str:
@@ -117,11 +118,13 @@ class Gemini:
         response = await self._generate(prompt, config, self._settings.gemini_search_model)
         return response.text.strip()
 
-    async def structured(self, prompt: str, schema: type[T], *, system: str | None = None) -> T:
+    async def structured(
+        self, prompt: str, schema: type[T], *, system: str | None = None, lite: bool = False
+    ) -> T:
         config = self._config(
             system, response_mime_type="application/json", response_schema=schema
         )
-        response = await self._generate(prompt, config, self._settings.gemini_model)
+        response = await self._generate_routed(prompt, config, lite)
         if isinstance(response.parsed, schema):
             return response.parsed
         try:
@@ -130,12 +133,32 @@ class Gemini:
             logger.warning("Gemini вернул ответ не по схеме %s: %s", schema.__name__, exc)
             raise AIContentError("ИИ вернул некорректный формат ответа.") from exc
 
-    async def _generate(
-        self, prompt: str, config: genai_types.GenerateContentConfig, model: str
+    async def _generate_routed(
+        self, prompt: str, config: genai_types.GenerateContentConfig, lite: bool
     ) -> genai_types.GenerateContentResponse:
-        if time.monotonic() < self._paused_until:
+        """
+        lite=True: bulk work (audit) on the lite model only. Otherwise the main
+        model, falling back to the lite one when the main model is overloaded
+        or out of quota, so the Major answers more plainly instead of not at all.
+        """
+        main, fallback = self._settings.gemini_model, self._settings.gemini_lite_model
+        if lite or main == fallback:
+            return await self._generate(prompt, config, fallback, self._settings.gemini_retries)
+        try:
+            # Few attempts on the main model: the fallback is better than a long wait.
+            return await self._generate(prompt, config, main, min(2, self._settings.gemini_retries))
+        except AIContentError:
+            raise
+        except AIError as exc:
+            logger.warning("Gemini [%s] недоступна (%s), переключаюсь на %s.",
+                           main, exc.user_message, fallback)
+            return await self._generate(prompt, config, fallback, self._settings.gemini_retries)
+
+    async def _generate(
+        self, prompt: str, config: genai_types.GenerateContentConfig, model: str, retries: int
+    ) -> genai_types.GenerateContentResponse:
+        if time.monotonic() < self._paused_until.get(model, 0.0):
             raise AIRateLimited("Лимит запросов к ИИ исчерпан. Попробуйте позже.")
-        retries = self._settings.gemini_retries
         for attempt in range(1, retries + 1):
             last = attempt == retries
             await self._limiter.acquire()
@@ -162,9 +185,9 @@ class Gemini:
                                    attempt, retries, delay, exc.message)
                     hard = _is_hard_quota(exc)
                     if hard:
-                        self._paused_until = time.monotonic() + _HARD_QUOTA_PAUSE
-                        logger.error("Gemini: квота исчерпана, пауза %d мин: %s",
-                                     _HARD_QUOTA_PAUSE // 60, exc.message)
+                        self._paused_until[model] = time.monotonic() + _HARD_QUOTA_PAUSE
+                        logger.error("Gemini [%s]: квота исчерпана, пауза %d мин: %s",
+                                     model, _HARD_QUOTA_PAUSE // 60, exc.message)
                     if hard or last or delay > _MAX_RETRY_DELAY:
                         raise AIRateLimited(
                             "Достигнут лимит запросов к ИИ. Попробуйте позже."

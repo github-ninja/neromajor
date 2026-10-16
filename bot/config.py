@@ -48,7 +48,8 @@ class Settings:
     db_pool_max: int
 
     gemini_api_key: str
-    gemini_model: str
+    gemini_model: str  # everything the Major says
+    gemini_lite_model: str  # bulk audit, and fallback when the main model is unavailable
     gemini_search_model: str
     # None = model default. Sampling parameters are deliberately absent:
     # Gemini ignores them since 3.6 and upcoming models reject them.
@@ -105,7 +106,8 @@ class Settings:
             db_pool_min=pool_min,
             db_pool_max=pool_max,
             gemini_api_key=_str("GEMINI_API_KEY"),
-            gemini_model=_str("GEMINI_MODEL", "gemini-3.1-flash-lite"),
+            gemini_model=_str("GEMINI_MODEL", "gemini-3.8-flash"),
+            gemini_lite_model=_str("GEMINI_LITE_MODEL", "gemini-3.1-flash-lite"),
             gemini_search_model=_str("GEMINI_SEARCH_MODEL", "gemini-3.6-flash"),
             gemini_thinking_level=thinking,
             gemini_timeout=_float("GEMINI_TIMEOUT", 90.0, minimum=1.0),

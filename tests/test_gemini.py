@@ -25,8 +25,10 @@ def make(monkeypatch):
         return None
     monkeypatch.setattr(gemini_mod.asyncio, "sleep", no_sleep)
 
-    def factory(responses):
+    def factory(responses, fallback=False):
         settings = dataclasses.replace(Settings.from_env(), gemini_rpm=10_000, gemini_retries=3)
+        if not fallback:  # single model unless the test is about routing
+            settings = dataclasses.replace(settings, gemini_model=settings.gemini_lite_model)
         g = Gemini(settings)
         calls = []
 
@@ -93,3 +95,28 @@ async def test_spending_cap_fails_fast_and_pauses_further_calls(make):
     with pytest.raises(AIRateLimited):
         await g.text("y")  # paused: no request is sent at all
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_main_model_falls_back_to_lite_when_overloaded(make):
+    busy = api_error(503, "This model is currently experiencing high demand.")
+    g, calls = make([busy, busy, ok("попроще")], fallback=True)
+    assert await g.text("x") == "попроще"
+    models = [c["model"] for c in calls]
+    assert models == [g._settings.gemini_model] * 2 + [g._settings.gemini_lite_model]
+
+
+@pytest.mark.asyncio
+async def test_lite_requests_never_touch_main_model(make):
+    g, calls = make([ok()], fallback=True)
+    await g.text("x", lite=True)
+    assert [c["model"] for c in calls] == [g._settings.gemini_lite_model]
+
+
+@pytest.mark.asyncio
+async def test_quota_pause_is_per_model(make):
+    cap = api_error(429, "Your project has exceeded its monthly spending cap.")
+    g, calls = make([cap, ok("lite"), ok("lite again")], fallback=True)
+    assert await g.text("x") == "lite"  # main capped -> fallback
+    assert await g.text("y") == "lite again"  # main paused: straight to lite
+    assert [c["model"] for c in calls] == [g._settings.gemini_model] + [g._settings.gemini_lite_model] * 2

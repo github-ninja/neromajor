@@ -137,7 +137,8 @@ class Auditor:
                 self._budget_used += 1
                 try:
                     result = await self._ai.structured(
-                        prompts.AUDIT_USER + text, AuditResult, system=prompts.AUDIT_SYSTEM
+                        prompts.AUDIT_USER + text, AuditResult,
+                        system=prompts.AUDIT_SYSTEM, lite=True,
                     )
                 except AIContentError as exc:
                     if len(batch) == 1:

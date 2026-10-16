@@ -67,7 +67,8 @@ class FakeAI:
         self.responses = list(responses)
         self.prompts = []
 
-    async def structured(self, prompt, schema, *, system=None):
+    async def structured(self, prompt, schema, *, system=None, lite=False):
+        assert lite  # audit must stay on the lite model
         self.prompts.append(prompt)
         r = self.responses.pop(0)
         if isinstance(r, Exception):
