@@ -1,6 +1,7 @@
 """Guest mode: the bot is @mentioned in a chat it isn't a member of."""
 
 import logging
+import random
 
 from aiogram import Router
 from aiogram.types import InlineQueryResultArticle, InputTextMessageContent, Message
@@ -24,6 +25,8 @@ async def handle_guest_message(message: Message, ai: Gemini) -> None:
     user = message.guest_bot_caller_user or message.from_user
     if not user:
         return
+    logger.info("Гостевой вызов (guest_query_id=%s, chat=%s, user=%d).",
+                message.guest_query_id, message.chat.id, user.id)
 
     reply_context = ""
     reply = message.reply_to_message
@@ -39,8 +42,9 @@ async def handle_guest_message(message: Message, ai: Gemini) -> None:
     try:
         answer = await ai.text(prompt, system=voice.CONVERSATION_PERSONA)
     except AIError as exc:
-        logger.warning("Гостевой вызов без ответа (%s): %s", message.guest_query_id, exc.user_message)
-        return
+        logger.warning("ИИ недоступен для гостевого вызова (%s): %s",
+                       message.guest_query_id, exc.user_message)
+        answer = random.choice(voice.FALLBACK_REPLIES)
 
     await message.answer_guest_query(
         result=InlineQueryResultArticle(

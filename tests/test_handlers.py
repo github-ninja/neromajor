@@ -7,8 +7,8 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.base import BaseSession
 from aiogram.enums import ParseMode
-from aiogram.methods import EditMessageText, GetMe, SendMessage
-from aiogram.types import Chat, Message, Update, User
+from aiogram.methods import AnswerGuestQuery, EditMessageText, GetMe, SendMessage
+from aiogram.types import Chat, Message, SentGuestMessage, Update, User
 
 from bot.config import Settings
 from bot.db.repo import OffenderStats, UserRef
@@ -31,6 +31,8 @@ class FakeSession(BaseSession):
         self.sent.append(method)
         if isinstance(method, GetMe):
             return BOT
+        if isinstance(method, AnswerGuestQuery):
+            return SentGuestMessage(inline_message_id="x")
         if isinstance(method, (SendMessage, EditMessageText)):
             return Message(message_id=len(self.sent) + 100, date=NOW, chat=CHAT,
                            from_user=BOT, text=method.text).as_(bot)
@@ -176,3 +178,25 @@ async def test_mention_gets_canned_reply_when_ai_is_down(env):
     [reply] = texts(session)
     assert reply in voice.FALLBACK_REPLIES
     assert len(repo.bot_saved) == 1
+
+
+@pytest.mark.asyncio
+async def test_guest_call_gets_canned_reply_when_ai_is_down(env):
+    from bot.ai import voice
+    from bot.ai.gemini import AIError
+
+    dp, bot, session, repo, _ = env
+
+    class DownAI:
+        async def text(self, prompt, *, system=None):
+            raise AIError("location not supported")
+
+    dp.workflow_data["ai"] = DownAI()
+    foreign = Chat(id=-555, type="supergroup", title="Чужой чат")
+    msg = Message(message_id=1, date=NOW, chat=foreign, from_user=USER,
+                  text="@neuromajor_bot привет", guest_query_id="q1")
+    await dp.feed_update(bot, Update(update_id=50, guest_message=msg))
+    [answer] = [m for m in session.sent if isinstance(m, AnswerGuestQuery)]
+    assert answer.guest_query_id == "q1"
+    assert answer.result.input_message_content.message_text in voice.FALLBACK_REPLIES
+    assert repo.saved == []  # foreign chats are never stored
