@@ -181,3 +181,34 @@ async def test_rate_limit_is_per_model(make, monkeypatch):
     assert await g.text("x") == "ответ"
     assert [c["model"] for c in calls] == [g._settings.gemini_model, g._settings.gemini_lite_model]
     assert waits == []  # the fallback model has its own, still empty, schedule
+
+
+@pytest.mark.asyncio
+async def test_hung_attempt_is_abandoned_and_retried_within_deadline(make):
+    g, calls = make([])
+    g._settings = dataclasses.replace(g._settings, gemini_reply_attempt_timeout=0.02)
+
+    async def hang_once(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            await asyncio.Event().wait()
+        return ok("со второй попытки")
+
+    g._client.aio.models.generate_content = hang_once
+    assert await g.text("x", deadline=5) == "со второй попытки"
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_calls_without_deadline_keep_the_long_timeout(make, monkeypatch):
+    seen = []
+    real_wait_for = gemini_mod.asyncio.wait_for
+
+    async def spy(aw, timeout):
+        seen.append(timeout)
+        return await real_wait_for(aw, timeout)
+
+    monkeypatch.setattr(gemini_mod.asyncio, "wait_for", spy)
+    g, _ = make([ok()])
+    await g.text("x")
+    assert seen == [g._settings.gemini_timeout]

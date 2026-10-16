@@ -132,8 +132,14 @@ class Gemini:
         lite: bool = False,
         deadline: float | None = None,
     ) -> str:
-        """*deadline*: give up after this many seconds in total, retries included."""
-        call = self._generate_routed(prompt, self._config(system), lite)
+        """
+        *deadline*: give up after this many seconds in total, retries included.
+        Such a call is someone waiting for an answer, so each attempt is also
+        cut at GEMINI_REPLY_ATTEMPT_TIMEOUT: under load a request that hangs
+        rarely comes back, while a fresh one often answers in seconds.
+        """
+        timeout = self._settings.gemini_reply_attempt_timeout if deadline else None
+        call = self._generate_routed(prompt, self._config(system), lite, timeout)
         response = await self._within(deadline, call)
         return response.text.strip()
 
@@ -163,7 +169,11 @@ class Gemini:
             raise AITimeout("ИИ не успел ответить.") from None
 
     async def _generate_routed(
-        self, prompt: str, config: genai_types.GenerateContentConfig, lite: bool
+        self,
+        prompt: str,
+        config: genai_types.GenerateContentConfig,
+        lite: bool,
+        timeout: float | None = None,
     ) -> genai_types.GenerateContentResponse:
         """
         lite=True: bulk work (audit) on the lite model only. Otherwise the main
@@ -172,21 +182,31 @@ class Gemini:
         """
         main, fallback = self._settings.gemini_model, self._settings.gemini_lite_model
         if lite or main == fallback:
-            return await self._generate(prompt, config, fallback, self._settings.gemini_retries)
+            return await self._generate(
+                prompt, config, fallback, self._settings.gemini_retries, timeout
+            )
         try:
             # One attempt: overload ("high demand" 503) is model-wide and
             # usually outlasts a retry, so the fallback is the retry.
-            return await self._generate(prompt, config, main, 1)
+            return await self._generate(prompt, config, main, 1, timeout)
         except AIContentError:
             raise
         except AIError as exc:
             logger.warning("Gemini [%s] недоступна (%s), переключаюсь на %s.",
                            main, exc.user_message, fallback)
-            return await self._generate(prompt, config, fallback, self._settings.gemini_retries)
+            return await self._generate(
+                prompt, config, fallback, self._settings.gemini_retries, timeout
+            )
 
     async def _generate(
-        self, prompt: str, config: genai_types.GenerateContentConfig, model: str, retries: int
+        self,
+        prompt: str,
+        config: genai_types.GenerateContentConfig,
+        model: str,
+        retries: int,
+        timeout: float | None = None,
     ) -> genai_types.GenerateContentResponse:
+        """*timeout*: per attempt, GEMINI_TIMEOUT by default."""
         if time.monotonic() < self._paused_until.get(model, 0.0):
             raise AIRateLimited("Лимит запросов к ИИ исчерпан. Попробуйте позже.")
         for attempt in range(1, retries + 1):
@@ -201,14 +221,13 @@ class Gemini:
                     self._client.aio.models.generate_content(
                         model=model, contents=prompt, config=config
                     ),
-                    timeout=self._settings.gemini_timeout,
+                    timeout=timeout or self._settings.gemini_timeout,
                 )
             except asyncio.TimeoutError:
                 logger.warning("Gemini таймаут (попытка %d/%d).", attempt, retries)
                 if last:
                     raise AITimeout("Превышено время ожидания ответа от ИИ.") from None
-                await asyncio.sleep(2 ** attempt)
-                continue
+                continue  # the wait itself was the backoff
             except genai_errors.APIError as exc:
                 if exc.code == 429:
                     hinted = _retry_delay(exc)
