@@ -57,9 +57,9 @@ def to_violations(
     findings: list[AuditFinding], batch: list[PendingMessage]
 ) -> list[NewViolation]:
     """
-    Validate model findings against the batch. Author, text and date always
-    come from the message itself, never from the model. Several findings for
-    one message are merged into a single violation.
+    Validate model findings against the batch: only messages actually in it
+    count (author, text and date then come from the message row, never from
+    the model). Several findings for one message merge into one violation.
     """
     by_id = {m.id: m for m in batch}
     merged: dict[int, dict] = {}
@@ -81,12 +81,9 @@ def to_violations(
     return [
         NewViolation(
             message_id=mid,
-            user_id=by_id[mid].user_id,
-            content=by_id[mid].content,
             article="; ".join(slot["articles"]),
             fines=slot["fines"],
             days=slot["days"],
-            committed_at=by_id[mid].created_at,
         )
         for mid, slot in merged.items()
     ]

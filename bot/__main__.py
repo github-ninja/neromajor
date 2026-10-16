@@ -48,6 +48,7 @@ async def run(settings: Settings) -> None:
 
         async def on_startup() -> None:
             me = await bot.me()
+            await repo.register_bot(me.id, me.username, me.full_name)
             background.append(asyncio.create_task(auditor.run_forever(), name="auditor"))
             background.append(asyncio.create_task(major.run_forever(), name="major"))
             logger.info("Бот запущен. ID=%d, username=@%s.", me.id, me.username)

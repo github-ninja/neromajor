@@ -30,7 +30,7 @@ def test_build_batch_flattens_newlines():
     assert text == "[1] User1: a b c"
 
 
-def test_to_violations_takes_facts_from_message_not_model():
+def test_to_violations_validates_and_merges_findings():
     batch = [msg(1, "крамола", user=7), msg(2)]
     findings = [
         AuditFinding(message_id=1, article="ст. 280 УК", fines=300_000, days=0),
@@ -40,9 +40,8 @@ def test_to_violations_takes_facts_from_message_not_model():
         AuditFinding(message_id=2, article="ст. 3", fines=-5, days=0),  # negative
     ]
     [v] = to_violations(findings, batch)
-    assert (v.message_id, v.user_id, v.content) == (1, 7, "крамола")
+    assert v.message_id == 1 and v.days == 0
     assert v.fines == 310_000 and v.article == "ст. 280 УК; ст. 282 УК"
-    assert v.committed_at == batch[0].created_at
 
 
 class FakeRepo:

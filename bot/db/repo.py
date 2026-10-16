@@ -25,12 +25,9 @@ class PendingMessage:
 @dataclass(frozen=True, slots=True)
 class NewViolation:
     message_id: int
-    user_id: int
-    content: str
     article: str
     fines: int
     days: int
-    committed_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,11 +65,32 @@ class Citizen:
     last_violation: datetime | None
 
 
+_UPSERT_USER = """
+    INSERT INTO users (user_id, username, first_name, last_name, display_name, is_bot, updated_at)
+    VALUES ($1, $2, $3, $4, $5, $6, now())
+    ON CONFLICT (user_id) DO UPDATE SET
+        username     = EXCLUDED.username,
+        first_name   = EXCLUDED.first_name,
+        last_name    = EXCLUDED.last_name,
+        display_name = EXCLUDED.display_name,
+        updated_at   = now()
+    WHERE (users.username, users.first_name, users.last_name, users.display_name)
+          IS DISTINCT FROM
+          (EXCLUDED.username, EXCLUDED.first_name, EXCLUDED.last_name, EXCLUDED.display_name)
+"""
+
+_ENSURE_CHAT = "INSERT INTO chats (chat_id) VALUES ($1) ON CONFLICT (chat_id) DO NOTHING"
+
+
 class Repository:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
 
     # -- writes from the message stream -------------------------------------
+
+    async def register_bot(self, bot_id: int, username: str | None, name: str) -> None:
+        """The bot is a user too: its replies are messages with a real author row."""
+        await self._pool.execute(_UPSERT_USER, bot_id, username, name, None, name, True)
 
     async def save_user_message(
         self,
@@ -87,26 +105,9 @@ class Repository:
     ) -> int:
         async with self._pool.acquire() as conn, conn.transaction():
             await conn.execute(
-                """
-                INSERT INTO users (user_id, username, first_name, last_name, display_name, updated_at)
-                VALUES ($1, $2, $3, $4, $5, now())
-                ON CONFLICT (user_id) DO UPDATE SET
-                    username     = EXCLUDED.username,
-                    first_name   = EXCLUDED.first_name,
-                    last_name    = EXCLUDED.last_name,
-                    display_name = EXCLUDED.display_name,
-                    updated_at   = now()
-                WHERE users.username     IS DISTINCT FROM EXCLUDED.username
-                   OR users.first_name   IS DISTINCT FROM EXCLUDED.first_name
-                   OR users.last_name    IS DISTINCT FROM EXCLUDED.last_name
-                   OR users.display_name IS DISTINCT FROM EXCLUDED.display_name
-                """,
-                user_id, username, first_name, last_name, display_name,
+                _UPSERT_USER, user_id, username, first_name, last_name, display_name, False
             )
-            await conn.execute(
-                "INSERT INTO chats (chat_id) VALUES ($1) ON CONFLICT (chat_id) DO NOTHING",
-                chat_id,
-            )
+            await conn.execute(_ENSURE_CHAT, chat_id)
             return await conn.fetchval(
                 """
                 INSERT INTO messages (chat_id, user_id, content, is_bot, tg_message_id)
@@ -119,13 +120,15 @@ class Repository:
     async def save_bot_message(
         self, chat_id: int, bot_id: int, content: str, tg_message_id: int | None
     ) -> None:
-        await self._pool.execute(
-            """
-            INSERT INTO messages (chat_id, user_id, content, is_bot, tg_message_id)
-            VALUES ($1, $2, $3, TRUE, $4)
-            """,
-            chat_id, bot_id, content, tg_message_id,
-        )
+        async with self._pool.acquire() as conn, conn.transaction():
+            await conn.execute(_ENSURE_CHAT, chat_id)
+            await conn.execute(
+                """
+                INSERT INTO messages (chat_id, user_id, content, is_bot, tg_message_id)
+                VALUES ($1, $2, $3, TRUE, $4)
+                """,
+                chat_id, bot_id, content, tg_message_id,
+            )
 
     # -- reads for conversation context -------------------------------------
 
@@ -135,7 +138,7 @@ class Repository:
             """
             SELECT CASE WHEN m.is_bot THEN NULL ELSE u.display_name END AS author, m.content
             FROM messages m
-            LEFT JOIN users u ON u.user_id = m.user_id
+            JOIN users u ON u.user_id = m.user_id
             WHERE m.chat_id = $1
             ORDER BY m.id DESC
             LIMIT $2
@@ -186,12 +189,12 @@ class Repository:
     # -- users --------------------------------------------------------------
 
     async def find_chat_user(self, chat_id: int, username: str) -> UserRef | None:
-        """Resolve @username to a user who has written in this chat."""
+        """Resolve @username to a human who has written in this chat."""
         row = await self._pool.fetchrow(
             """
             SELECT u.user_id, u.display_name, u.username
             FROM users u
-            WHERE lower(u.username) = lower($2)
+            WHERE lower(u.username) = lower($2) AND NOT u.is_bot
               AND EXISTS (SELECT 1 FROM messages m WHERE m.chat_id = $1 AND m.user_id = u.user_id)
             ORDER BY u.updated_at DESC
             LIMIT 1
@@ -258,13 +261,11 @@ class Repository:
             for v in violations:
                 status = await conn.execute(
                     """
-                    INSERT INTO violations
-                        (chat_id, user_id, message_id, content, article, fines, days, committed_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                    ON CONFLICT (message_id) WHERE message_id IS NOT NULL DO NOTHING
+                    INSERT INTO violations (message_id, article, fines, days)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (message_id) DO NOTHING
                     """,
-                    chat_id, v.user_id, v.message_id, v.content, v.article,
-                    v.fines, v.days, v.committed_at,
+                    v.message_id, v.article, v.fines, v.days,
                 )
                 inserted += int(status.rsplit(" ", 1)[-1])
             await conn.execute(
@@ -288,19 +289,20 @@ class Repository:
         rows = await self._pool.fetch(
             """
             SELECT
-                v.user_id,
+                m.user_id,
                 u.display_name,
                 count(*)                     AS total_count,
                 sum(v.fines)                 AS total_fines,
                 sum(v.days)                  AS total_days,
-                max(v.committed_at)          AS last_violation,
-                count(*)     FILTER (WHERE v.committed_at > now() - interval '24 hours') AS day_count,
-                sum(v.fines) FILTER (WHERE v.committed_at > now() - interval '24 hours') AS day_fines,
-                sum(v.days)  FILTER (WHERE v.committed_at > now() - interval '24 hours') AS day_days
+                max(m.created_at)            AS last_violation,
+                count(*)     FILTER (WHERE m.created_at > now() - interval '24 hours') AS day_count,
+                sum(v.fines) FILTER (WHERE m.created_at > now() - interval '24 hours') AS day_fines,
+                sum(v.days)  FILTER (WHERE m.created_at > now() - interval '24 hours') AS day_days
             FROM violations v
-            JOIN users u ON u.user_id = v.user_id
-            WHERE v.chat_id = $1
-            GROUP BY v.user_id, u.display_name
+            JOIN messages m ON m.id = v.message_id
+            JOIN users u ON u.user_id = m.user_id
+            WHERE m.chat_id = $1
+            GROUP BY m.user_id, u.display_name
             """,
             chat_id,
         )
@@ -322,28 +324,37 @@ class Repository:
     async def user_violations(self, chat_id: int, user_id: int) -> list[ViolationRow]:
         rows = await self._pool.fetch(
             """
-            SELECT committed_at, content, article, fines, days
-            FROM violations
-            WHERE chat_id = $1 AND user_id = $2
-            ORDER BY committed_at DESC
+            SELECT m.created_at, m.content, v.article, v.fines, v.days
+            FROM violations v
+            JOIN messages m ON m.id = v.message_id
+            WHERE m.chat_id = $1 AND m.user_id = $2
+            ORDER BY m.created_at DESC
             """,
             chat_id, user_id,
         )
         return [
-            ViolationRow(r["committed_at"], r["content"], r["article"], r["fines"], r["days"])
+            ViolationRow(r["created_at"], r["content"], r["article"], r["fines"], r["days"])
             for r in rows
         ]
 
     async def reset_violations(self, chat_id: int) -> None:
         """Amnesty: forget all violations and treat every existing message as audited."""
         async with self._pool.acquire() as conn, conn.transaction():
-            await conn.execute("DELETE FROM violations WHERE chat_id = $1", chat_id)
             await conn.execute(
                 """
-                INSERT INTO chats (chat_id, audit_cursor, last_audit_at)
-                VALUES ($1, COALESCE((SELECT max(id) FROM messages WHERE chat_id = $1), 0), now())
-                ON CONFLICT (chat_id) DO UPDATE
-                SET audit_cursor = EXCLUDED.audit_cursor, last_audit_at = now()
+                DELETE FROM violations v
+                USING messages m
+                WHERE m.id = v.message_id AND m.chat_id = $1
+                """,
+                chat_id,
+            )
+            await conn.execute(_ENSURE_CHAT, chat_id)
+            await conn.execute(
+                """
+                UPDATE chats
+                SET audit_cursor  = COALESCE((SELECT max(id) FROM messages WHERE chat_id = $1), 0),
+                    last_audit_at = now()
+                WHERE chat_id = $1
                 """,
                 chat_id,
             )
@@ -365,7 +376,13 @@ class Repository:
 
     async def last_bot_message_at(self, chat_id: int) -> datetime | None:
         return await self._pool.fetchval(
-            "SELECT max(created_at) FROM messages WHERE chat_id = $1 AND is_bot", chat_id
+            """
+            SELECT created_at FROM messages
+            WHERE chat_id = $1 AND is_bot
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            chat_id,
         )
 
     async def proactive_candidates(self, inactive_hours: int, today: date) -> list[int]:
@@ -391,20 +408,23 @@ class Repository:
         )
 
     async def random_citizen(self, chat_id: int) -> Citizen | None:
+        """A random human active in the chat within 30 days, with their record."""
         row = await self._pool.fetchrow(
             """
-            SELECT u.display_name,
-                   COALESCE(sum(v.fines), 0) AS total_fines,
-                   max(v.committed_at)       AS last_violation
-            FROM users u
-            LEFT JOIN violations v ON v.user_id = u.user_id AND v.chat_id = $1
-            WHERE u.user_id IN (
+            WITH active AS (
                 SELECT DISTINCT user_id FROM messages
                 WHERE chat_id = $1 AND NOT is_bot AND created_at > now() - interval '30 days'
+            ), picked AS (
+                SELECT user_id FROM active ORDER BY random() LIMIT 1
             )
-            GROUP BY u.user_id, u.display_name
-            ORDER BY random()
-            LIMIT 1
+            SELECT u.display_name,
+                   COALESCE(sum(v.fines), 0) AS total_fines,
+                   max(m.created_at) FILTER (WHERE v.id IS NOT NULL) AS last_violation
+            FROM picked p
+            JOIN users u ON u.user_id = p.user_id
+            LEFT JOIN messages m ON m.chat_id = $1 AND m.user_id = p.user_id
+            LEFT JOIN violations v ON v.message_id = m.id
+            GROUP BY u.display_name
             """,
             chat_id,
         )
