@@ -12,7 +12,6 @@ from utils import safe_generate_content, escape_html
 
 logger = logging.getLogger(__name__)
 
-# Bot name shown to AI so it can refer to itself correctly
 _BOT_NAME = "Товарищ Майор"
 
 _PROMPT_REPLY = (
@@ -22,9 +21,12 @@ _PROMPT_REPLY = (
     "Гражданин {name} процитировал твоё сообщение: «{quoted}» "
     "и написал в ответ: «{reply}».\n\n"
     "Ответь в контексте этого разговора — саркастично, с пассивной агрессией, "
-    "в стиле сотрудника ФСБ. Можешь развить мысль или задать встречный вопрос. "
-    "Не повторяй то, что уже говорил. Без звёздочек и markdown-разметки."
+    "в стиле советского следователя. Не задавай вопросов. "
+    "Не повторяй дословно то, что уже говорил. "
+    "Твои предыдущие реплики в истории уже сказаны — каждый ответ должен быть новой мыслью. "
     "Отвечай только своими словами, без префиксов вроде 'Товарищ Майор:' или эмодзи в начале. "
+    "Без звёздочек и markdown-разметки. "
+    "Ответ — не более двух-трёх коротких предложений, не растекайся мыслью."
 )
 
 _PROMPT_MENTION = (
@@ -33,44 +35,46 @@ _PROMPT_MENTION = (
     "История беседы:\n{context}\n\n"
     "Гражданин {name} обратился к тебе лично: «{text}».\n\n"
     "Ответь в контексте этого разговора — с пассивной агрессией и надменным тоном сотрудника ФСБ. "
-    "Можешь обратиться к гражданину по имени, развить тему или задать встречный вопрос. "
-    "Не повторяй то, что уже говорил. Без звёздочек и markdown-разметки."
+    "Можешь обратиться к гражданину по имени, но не задавай вопросов. "
+    "Не повторяй дословно то, что уже говорил. "
+    "Твои предыдущие реплики в истории уже сказаны — каждый ответ должен быть новой мыслью. "
     "Отвечай только своими словами, без префиксов вроде 'Товарищ Майор:' или эмодзи в начале. "
+    "Без звёздочек и markdown-разметки. "
+    "Ответ — не более двух-трёх коротких предложений, не растекайся мыслью."
 )
 
 
-def _fetch_context(chat_id: int, bot_id: int, bot_display_name: str) -> str:
+def _fetch_context(chat_id: int) -> str:
     """
-    Return last MENTION_CONTEXT_MESSAGES messages as formatted dialogue,
-    with bot messages labeled as bot_display_name.
+    Return the last MENTION_CONTEXT_MESSAGES messages as formatted dialogue.
+    Bot messages are identified via LEFT JOIN — rows with no users entry get _BOT_NAME.
     """
     with db.get_connection() as conn:
         with conn.cursor(cursor_factory=DictCursor) as cur:
             cur.execute(
                 """
-                SELECT u.display_name, m.content, m.is_bot
+                SELECT COALESCE(u.display_name, %s) AS display_name, m.content
                 FROM messages m
-                JOIN users u ON u.user_id = m.user_id
+                LEFT JOIN users u ON u.user_id = m.user_id
                 WHERE m.chat_id = %s
                 ORDER BY m.timestamp DESC
                 LIMIT %s
                 """,
-                (chat_id, config.MENTION_CONTEXT_MESSAGES),
+                (_BOT_NAME, chat_id, config.MENTION_CONTEXT_MESSAGES),
             )
             rows = cur.fetchall()
     if not rows:
         return ""
     lines = []
     for r in reversed(rows):
-        speaker = bot_display_name if r["is_bot"] else r["display_name"]
-        lines.append(f"{speaker}: {r['content']}")
+        lines.append(f"{r['display_name']}: {r['content']}")
     return "\n".join(lines)
 
 
 async def handle_mention(message: types.Message, bot: Bot, bot_id: int) -> None:
     """
-    Called from store_message when the bot is quoted or mentioned.
-    Fetches conversation context including bot's own messages and replies.
+    Called from store_message when the bot is quoted or @mentioned.
+    Passes full conversation context (including bot's own history) to the AI.
     """
     user = message.from_user
     if not user:
@@ -82,7 +86,7 @@ async def handle_mention(message: types.Message, bot: Bot, bot_id: int) -> None:
         or f"ID{user.id}"
     )
 
-    context = await db.run_in_thread(_fetch_context, message.chat.id, bot_id, _BOT_NAME)
+    context = await db.run_in_thread(_fetch_context, message.chat.id)
 
     reply = message.reply_to_message
     if reply and reply.from_user and reply.from_user.id == bot_id:
@@ -109,14 +113,12 @@ async def handle_mention(message: types.Message, bot: Bot, bot_id: int) -> None:
         return
 
     text = result["text"].strip()
-
     try:
         await message.reply(
-            f"🕵️ {escape_html(text)}",
+            escape_html(text),
             parse_mode="HTML",
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
-        # Save bot reply to DB so it appears in future context
         from handlers.message import save_bot_message
         await db.run_in_thread(save_bot_message, message.chat.id, bot_id, text)
     except Exception:

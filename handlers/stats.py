@@ -8,13 +8,21 @@ from datetime import datetime, timezone
 
 from aiogram import types
 from aiogram.types import LinkPreviewOptions
-
 from psycopg2.extras import DictCursor
 
 import db
+import major_voice
+from handlers._helpers import status_message
 from utils import clean_json_text, escape_html, safe_generate_content
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Limits
+# ---------------------------------------------------------------------------
+
+_MAX_AUDIT_MESSAGES = 200       # максимум сообщений, передаваемых в AI
+_MAX_HISTORY_CHARS  = 30_000    # максимум символов в history (дополнительная защита)
 
 # ---------------------------------------------------------------------------
 # Prompts
@@ -55,9 +63,8 @@ _AUDIT_PROMPT_HEADER = (
 _THOUGHTS_PROMPT = (
     "Ты суровый товарищ майор ФСБ. "
     "Дай одну короткую, хлёсткую и ироничную фразу по ситуации: {context} "
-    "Используй следственный лексикон."
+    "Используй следственный лексикон. Без звёздочек и markdown-разметки."
 )
-
 
 # ---------------------------------------------------------------------------
 # Index calculation
@@ -67,8 +74,8 @@ def _calc_loyalty_index(t_count: int, t_fines: int, t_days: int, clean_days: int
     """
     Returns (loyalty_index, daily_recovery_rate).
 
-    Index is NOT clamped — can go below 0 and above 100.
-    This makes the full severity visible in the report.
+    Index is NOT clamped — can go negative. This makes the full severity
+    visible in the report (e.g. -195% vs 0%).
 
     Penalty (severity-weighted):
       - Each violation:          -3 points
@@ -81,16 +88,15 @@ def _calc_loyalty_index(t_count: int, t_fines: int, t_days: int, clean_days: int
     penalty = t_count * 3 + t_fines // 10_000 + t_days * 2
     daily_recovery = max(1, 10 - t_count // 2)
     bonus = min(50, clean_days * daily_recovery)
-    index = 100 - penalty + bonus
-    return index, daily_recovery
+    return 100 - penalty + bonus, daily_recovery
 
 
 # ---------------------------------------------------------------------------
-# DB helpers (sync, run via asyncio.to_thread)
+# DB helpers
 # ---------------------------------------------------------------------------
 
 def _fetch_new_messages(chat_id: int) -> tuple[list, datetime]:
-    """Return (messages, start_time) for the audit window."""
+    """Return (human_messages, start_time) for the current audit window."""
     with db.get_connection() as conn:
         with conn.cursor(cursor_factory=DictCursor) as cur:
             cur.execute(
@@ -101,12 +107,13 @@ def _fetch_new_messages(chat_id: int) -> tuple[list, datetime]:
             start_time = row["last_check"] if row else (
                 datetime.now(tz=timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
             )
+            # Only analyse human messages — bot replies must not trigger violations
             cur.execute(
                 """
                 SELECT u.display_name, m.content, m.user_id
                 FROM messages m
                 JOIN users u ON m.user_id = u.user_id
-                WHERE m.chat_id = %s AND m.timestamp > %s
+                WHERE m.chat_id = %s AND m.timestamp > %s AND m.is_bot = FALSE
                 """,
                 (chat_id, start_time),
             )
@@ -152,7 +159,8 @@ def _save_violations(chat_id: int, updates: dict, messages: list) -> None:
                             (chat_id, user_id, content, article, fines, days, violation_count)
                         VALUES (%s, %s, %s, %s, %s, %s, 1)
                         """,
-                        (chat_id, user_id, content, v.get("article", ""), v.get("fines", 0), v.get("days", 0)),
+                        (chat_id, user_id, content, v.get("article", ""),
+                         v.get("fines", 0), v.get("days", 0)),
                     )
                     seen_this_run.add(content)
                     existing.add(content)
@@ -173,7 +181,7 @@ def _update_checkpoint(chat_id: int) -> None:
 
 
 def _fetch_all_stats(chat_id: int) -> list[dict]:
-    """Return aggregated stats for all violators, sorted by loyalty index ascending."""
+    """Return aggregated violation stats, sorted by loyalty index ascending (worst first)."""
     with db.get_connection() as conn:
         with conn.cursor(cursor_factory=DictCursor) as cur:
             cur.execute(
@@ -185,8 +193,8 @@ def _fetch_all_stats(chat_id: int) -> list[dict]:
                     SUM(v.days)            AS t_days,
                     SUM(v.violation_count) AS t_count,
                     MAX(v.created_at)      AS last_crime,
-                    SUM(v.fines) FILTER (WHERE v.created_at > NOW() - INTERVAL '24 hours')           AS d_fines,
-                    SUM(v.days)  FILTER (WHERE v.created_at > NOW() - INTERVAL '24 hours')           AS d_days,
+                    SUM(v.fines) FILTER (WHERE v.created_at > NOW() - INTERVAL '24 hours') AS d_fines,
+                    SUM(v.days)  FILTER (WHERE v.created_at > NOW() - INTERVAL '24 hours') AS d_days,
                     SUM(v.violation_count) FILTER (WHERE v.created_at > NOW() - INTERVAL '24 hours') AS d_count
                 FROM violation_logs v
                 JOIN users u ON u.user_id = v.user_id
@@ -200,35 +208,22 @@ def _fetch_all_stats(chat_id: int) -> list[dict]:
     now = datetime.now(tz=timezone.utc)
     result = []
     for r in rows:
-        t_count = r["t_count"] or 0
-        t_fines = r["t_fines"] or 0
-        t_days  = r["t_days"]  or 0
+        t_count = int(r["t_count"] or 0)
+        t_fines = int(r["t_fines"] or 0)
+        t_days  = int(r["t_days"]  or 0)
         last_crime = r["last_crime"]
-
         if last_crime is not None and last_crime.tzinfo is None:
             last_crime = last_crime.replace(tzinfo=timezone.utc)
-
         clean_days = (now - last_crime).days if last_crime else 0
         loyalty_idx, daily_recovery = _calc_loyalty_index(t_count, t_fines, t_days, clean_days)
 
         result.append({
             "name": r["display_name"],
-            "t": {
-                "f": t_fines,
-                "d": t_days,
-                "c": t_count,
-                "i": loyalty_idx,
-                "clean": clean_days,
-                "rate": daily_recovery,
-            },
-            "d": {
-                "f": r["d_fines"] or 0,
-                "d": r["d_days"]  or 0,
-                "c": r["d_count"] or 0,
-            },
+            "t": {"f": t_fines, "d": t_days, "c": t_count,
+                  "i": loyalty_idx, "clean": clean_days, "rate": daily_recovery},
+            "d": {"f": int(r["d_fines"] or 0), "d": int(r["d_days"] or 0), "c": int(r["d_count"] or 0)},
         })
 
-    # Worst loyalty index first
     result.sort(key=lambda x: x["t"]["i"])
     return result
 
@@ -243,11 +238,30 @@ async def handle_stats(message: types.Message) -> None:
 
     try:
         new_msgs, start_time = await db.run_in_thread(_fetch_new_messages, chat_id)
-
         ai_ok = False
 
         if new_msgs:
-            history = "\n".join(f"{m['display_name']}: {m['content']}" for m in new_msgs)
+            # Берём только последние _MAX_AUDIT_MESSAGES сообщений для AI,
+            # чтобы не переполнять контекст и не провоцировать галлюцинации модели.
+            # Полный new_msgs сохраняется для маппинга имён → user_id в _save_violations.
+            msgs_for_ai = new_msgs[-_MAX_AUDIT_MESSAGES:]
+
+            history = "\n".join(f"{m['display_name']}: {m['content']}" for m in msgs_for_ai)
+
+            # Дополнительная защита: обрезаем по символам с начала (старые записи),
+            # чтобы гарантированно не превысить контекстное окно модели.
+            if len(history) > _MAX_HISTORY_CHARS:
+                history = history[-_MAX_HISTORY_CHARS:]
+                logger.info(
+                    "history обрезан до %d символов (chat=%d).",
+                    _MAX_HISTORY_CHARS, chat_id,
+                )
+
+            logger.info(
+                "Отправляю в AI %d сообщений из %d (chat=%d).",
+                len(msgs_for_ai), len(new_msgs), chat_id,
+            )
+
             ai_result = await safe_generate_content(_AUDIT_PROMPT_HEADER + history)
 
             if ai_result.get("status") == "rate_limit":
@@ -269,7 +283,9 @@ async def handle_stats(message: types.Message) -> None:
             raw_json = clean_json_text(ai_result["text"])
             raw_json = " ".join(raw_json.split())
             raw_json = re.sub(r",\s*}", "}", raw_json)
-            logger.info("Gemini raw response: %s", raw_json)
+
+            # Логируем только первые 500 символов — полный ответ может быть огромным
+            logger.info("Gemini raw response (first 500): %.500s", raw_json)
 
             try:
                 updates = json.loads(raw_json)
@@ -290,7 +306,6 @@ async def handle_stats(message: types.Message) -> None:
             await db.run_in_thread(_update_checkpoint, chat_id)
 
         final_data = await db.run_in_thread(_fetch_all_stats, chat_id)
-
         if not final_data:
             await status_msg.edit_text("✅ Нарушений не зафиксировано.")
             return
@@ -306,15 +321,7 @@ async def handle_stats(message: types.Message) -> None:
 
         for p in final_data:
             idx = p["t"]["i"]
-            if idx >= 80:
-                icon = "🟢"
-            elif idx >= 40:
-                icon = "🟡"
-            elif idx >= 0:
-                icon = "🔴"
-            else:
-                icon = "💀"
-
+            icon = "🟢" if idx >= 80 else "🟡" if idx >= 40 else "🔴" if idx >= 0 else "💀"
             lines.append(f"\n{icon} <b>{escape_html(p['name'])}</b>")
 
             if p["d"]["c"] > 0:
@@ -365,7 +372,7 @@ async def handle_stats(message: types.Message) -> None:
 
         lines += [
             "\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯",
-            f"🕵️ <b>ОСОБОЕ МНЕНИЕ:</b>\n{escape_html(thoughts)}",
+            f"<b>ОСОБОЕ МНЕНИЕ:</b>\n{escape_html(thoughts)}",
             "\n<a href=\"https://telegra.ph/Nejromajor--logika-podscheta-narushenij-02-27\">📋 Методика расчёта санкций</a>",
         ]
 

@@ -7,6 +7,7 @@ from aiogram.filters import CommandObject
 from psycopg2.extras import DictCursor
 
 import db
+from handlers._helpers import status_message
 from utils import escape_html
 
 logger = logging.getLogger(__name__)
@@ -124,22 +125,26 @@ def _render_violations(rows: list, budget: int) -> tuple[str, int, int]:
 
 
 async def handle_case(message: types.Message, command: CommandObject) -> None:
-    status_msg = await message.answer("📂 <b>Формирую досье гражданина...</b>", parse_mode="HTML")
     chat_id = message.chat.id
-
     target = command.args.strip() if command.args else None
-    if not target:
-        await status_msg.edit_text(
-            "Использование: /case username\nПример: /case ivanov  или  /case @ivanov"
-        )
-        return
 
-    try:
+    async with status_message(
+        message,
+        "📂 <b>Формирую досье гражданина...</b>",
+        error_text="❌ Ошибка при формировании досье.",
+        log_ctx=f"handle_case target={target}",
+    ) as status:
+        if not target:
+            await status.replace(
+                "Использование: /case username\nПример: /case ivanov  или  /case @ivanov"
+            )
+            return
+
         result = await db.run_in_thread(_fetch_case, chat_id, target)
 
         if result is None:
             clean_target = target.lstrip("@")
-            await status_msg.edit_text(
+            await status.replace(
                 f"Досье пользователя @{escape_html(clean_target)} отсутствует или у него нет нарушений.\n"
                 "Убедитесь, что пользователь имеет username в Telegram и был проверен через /stats."
             )
@@ -168,8 +173,4 @@ async def handle_case(message: types.Message, command: CommandObject) -> None:
             all_sections.append(_build_footer(severe_count, total, shown))
             all_sections.append("")
 
-        await status_msg.edit_text("\n".join(all_sections), parse_mode="HTML")
-
-    except Exception:
-        logger.exception("Ошибка в handle_case (chat=%d, target=%s).", chat_id, target)
-        await status_msg.edit_text("❌ Ошибка при формировании досье.")
+        await status.finish("\n".join(all_sections), parse_mode="HTML")

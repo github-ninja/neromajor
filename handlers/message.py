@@ -14,6 +14,7 @@ _bot_username: str | None = None
 
 
 def set_bot(bot: Bot, bot_id: int, bot_username: str) -> None:
+    """Inject bot instance and identity at startup. Must be called before polling."""
     global _bot, _bot_id, _bot_username
     _bot = bot
     _bot_id = bot_id
@@ -53,7 +54,7 @@ def _store(chat_id: int, user: types.User, text: str) -> None:
 
 
 def save_bot_message(chat_id: int, bot_user_id: int, text: str) -> None:
-    """Save a bot reply into messages so it appears in conversation context."""
+    """Persist a bot reply so it appears in future conversation context."""
     with db.get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -64,7 +65,8 @@ def save_bot_message(chat_id: int, bot_user_id: int, text: str) -> None:
 
 
 def _is_mention(message: types.Message) -> bool:
-    if not _bot_username or not message.entities:
+    """Return True if the message contains a @mention of the bot."""
+    if not _bot_username or not message.text or not message.entities:
         return False
     for entity in message.entities:
         if entity.type == "mention":
@@ -75,6 +77,7 @@ def _is_mention(message: types.Message) -> bool:
 
 
 def _is_reply_to_bot(message: types.Message) -> bool:
+    """Return True if the message is a direct reply to a bot message."""
     reply = message.reply_to_message
     return bool(reply and reply.from_user and reply.from_user.id == _bot_id)
 

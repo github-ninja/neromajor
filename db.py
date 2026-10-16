@@ -17,6 +17,7 @@ _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
 
 def init_pool() -> None:
+    """Create the global threaded connection pool. Called once at startup."""
     global _pool
     _pool = psycopg2.pool.ThreadedConnectionPool(
         minconn=config.DB_POOL_MIN,
@@ -27,6 +28,7 @@ def init_pool() -> None:
 
 
 def close_pool() -> None:
+    """Gracefully close the pool on shutdown."""
     if _pool is not None:
         _pool.closeall()
         logger.info("Пул соединений закрыт.")
@@ -34,7 +36,9 @@ def close_pool() -> None:
 
 @contextmanager
 def get_connection() -> Generator[psycopg2.extensions.connection, None, None]:
-    assert _pool is not None, "Пул соединений не инициализирован."
+    """Borrow a connection from the pool, roll back on unhandled exceptions."""
+    if _pool is None:
+        raise RuntimeError("Пул соединений не инициализирован. Вызовите init_pool() при старте.")
     conn = _pool.getconn()
     try:
         yield conn
@@ -46,6 +50,7 @@ def get_connection() -> Generator[psycopg2.extensions.connection, None, None]:
 
 
 async def run_in_thread(func, *args):
+    """Run a blocking DB call in a thread pool to keep the event loop free."""
     return await asyncio.to_thread(func, *args)
 
 
@@ -54,8 +59,11 @@ async def run_in_thread(func, *args):
 # ---------------------------------------------------------------------------
 
 def _create_schema() -> None:
+    """Create all tables and indexes. Safe to call repeatedly (idempotent)."""
     with get_connection() as conn:
         with conn.cursor() as cur:
+
+            # users — one row per Telegram user, display_name updated on each message
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id      BIGINT PRIMARY KEY,
@@ -67,6 +75,7 @@ def _create_schema() -> None:
                 )
             """)
 
+            # messages — every chat message including bot replies (is_bot=TRUE)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id         SERIAL PRIMARY KEY,
@@ -77,10 +86,6 @@ def _create_schema() -> None:
                     timestamp  TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
-            # Migration: add is_bot column if not present (existing installs)
-            cur.execute(
-                "ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT FALSE"
-            )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_messages_chat_ts "
                 "ON messages (chat_id, timestamp)"
@@ -90,6 +95,7 @@ def _create_schema() -> None:
                 "ON messages (user_id)"
             )
 
+            # violation_logs — audit results written by /stats
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS violation_logs (
                     id              SERIAL PRIMARY KEY,
@@ -108,16 +114,19 @@ def _create_schema() -> None:
                 "ON violation_logs (chat_id, user_id, created_at)"
             )
 
+            # stats_checkpoint — tracks the last /stats audit time per chat
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS stats_checkpoint (
                     chat_id    BIGINT PRIMARY KEY,
                     last_check TIMESTAMPTZ NOT NULL
                 )
             """)
+
         conn.commit()
 
 
 async def init_db() -> None:
+    """Async entry point: init pool then create schema."""
     init_pool()
     try:
         await run_in_thread(_create_schema)
