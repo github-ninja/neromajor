@@ -28,16 +28,16 @@ async def handle_guest_message(message: Message, ai: Gemini) -> None:
     reply_context = ""
     reply = message.reply_to_message
     if reply and (reply.text or reply.caption):
-        quoted = (reply.text or reply.caption).strip()[:200]
+        quoted = (reply.text or reply.caption).strip()[:500]
         reply_context = prompts.GUEST_REPLY_CONTEXT.format(quoted=quoted)
 
     prompt = prompts.GUEST.format(
         name=display_name(user),
-        text=(message.text or message.caption or "").strip()[:300],
+        text=(message.text or message.caption or "").strip()[:1000],
         reply_context=reply_context,
     )
     try:
-        answer = await ai.text(prompt, system=voice.PERSONA)
+        answer = await ai.text(prompt, system=voice.CONVERSATION_PERSONA)
     except AIError as exc:
         logger.warning("Гостевой вызов без ответа (%s): %s", message.guest_query_id, exc.user_message)
         return

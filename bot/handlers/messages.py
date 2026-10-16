@@ -20,8 +20,8 @@ from bot.tg import display_name, escape
 logger = logging.getLogger(__name__)
 router = Router(name="messages")
 
-_QUOTE_CHARS = 200
-_TEXT_CHARS = 300
+_QUOTE_CHARS = 500
+_TEXT_CHARS = 1000
 
 
 class MentionLimiter:
@@ -83,7 +83,7 @@ async def _answer(
         )
 
     try:
-        answer = await ai.text(prompt, system=voice.PERSONA)
+        answer = await ai.text(prompt, system=voice.CONVERSATION_PERSONA)
     except AIError as exc:
         logger.warning("ИИ недоступен для ответа на упоминание (chat=%d): %s",
                        message.chat.id, exc.user_message)
