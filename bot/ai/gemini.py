@@ -106,6 +106,22 @@ def _is_transient(exc: genai_errors.APIError) -> bool:
     return exc.code >= 500 or (exc.code == 400 and "location" in (exc.message or "").lower())
 
 
+async def _first_success(*tasks: asyncio.Future[R]) -> R:
+    """Result of whichever task succeeds first; the last error if all fail."""
+    pending = set(tasks)
+    try:
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                if task.exception() is None:
+                    return task.result()
+                error = task.exception()
+        raise error
+    finally:
+        for task in pending:
+            task.cancel()
+
+
 class Gemini:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -134,12 +150,13 @@ class Gemini:
     ) -> str:
         """
         *deadline*: give up after this many seconds in total, retries included.
-        Such a call is someone waiting for an answer, so each attempt is also
-        cut at GEMINI_REPLY_ATTEMPT_TIMEOUT: under load a request that hangs
-        rarely comes back, while a fresh one often answers in seconds.
+        Such a call is someone waiting for an answer, so when the main model is
+        silent for GEMINI_REPLY_HEDGE_AFTER the lite one is asked in parallel and
+        the first answer wins. A slow request is never abandoned: under load
+        Google often takes a minute, but does answer.
         """
-        timeout = self._settings.gemini_reply_attempt_timeout if deadline else None
-        call = self._generate_routed(prompt, self._config(system), lite, timeout)
+        hedge_after = self._settings.gemini_reply_hedge_after if deadline else None
+        call = self._generate_routed(prompt, self._config(system), lite, hedge_after)
         response = await self._within(deadline, call)
         return response.text.strip()
 
@@ -173,30 +190,38 @@ class Gemini:
         prompt: str,
         config: genai_types.GenerateContentConfig,
         lite: bool,
-        timeout: float | None = None,
+        hedge_after: float | None = None,
     ) -> genai_types.GenerateContentResponse:
         """
         lite=True: bulk work (audit) on the lite model only. Otherwise the main
         model, falling back to the lite one when the main model is overloaded
         or out of quota, so the Major answers more plainly instead of not at all.
+        *hedge_after*: also ask the lite model if the main one is still silent.
         """
         main, fallback = self._settings.gemini_model, self._settings.gemini_lite_model
+        retries = self._settings.gemini_retries
         if lite or main == fallback:
-            return await self._generate(
-                prompt, config, fallback, self._settings.gemini_retries, timeout
-            )
+            return await self._generate(prompt, config, fallback, retries)
+        # One attempt: overload ("high demand" 503) is model-wide and
+        # usually outlasts a retry, so the fallback is the retry.
+        first = asyncio.ensure_future(self._generate(prompt, config, main, 1))
         try:
-            # One attempt: overload ("high demand" 503) is model-wide and
-            # usually outlasts a retry, so the fallback is the retry.
-            return await self._generate(prompt, config, main, 1, timeout)
-        except AIContentError:
-            raise
-        except AIError as exc:
-            logger.warning("Gemini [%s] недоступна (%s), переключаюсь на %s.",
-                           main, exc.user_message, fallback)
-            return await self._generate(
-                prompt, config, fallback, self._settings.gemini_retries, timeout
-            )
+            await asyncio.wait({first}, timeout=hedge_after)
+            if not first.done():
+                logger.warning("Gemini [%s] молчит %.0f с, параллельно спрашиваю %s.",
+                               main, hedge_after, fallback)
+                second = asyncio.ensure_future(self._generate(prompt, config, fallback, retries))
+                return await _first_success(first, second)
+            try:
+                return first.result()
+            except AIContentError:
+                raise
+            except AIError as exc:
+                logger.warning("Gemini [%s] недоступна (%s), переключаюсь на %s.",
+                               main, exc.user_message, fallback)
+                return await self._generate(prompt, config, fallback, retries)
+        finally:
+            first.cancel()
 
     async def _generate(
         self,
@@ -204,9 +229,7 @@ class Gemini:
         config: genai_types.GenerateContentConfig,
         model: str,
         retries: int,
-        timeout: float | None = None,
     ) -> genai_types.GenerateContentResponse:
-        """*timeout*: per attempt, GEMINI_TIMEOUT by default."""
         if time.monotonic() < self._paused_until.get(model, 0.0):
             raise AIRateLimited("Лимит запросов к ИИ исчерпан. Попробуйте позже.")
         for attempt in range(1, retries + 1):
@@ -221,7 +244,7 @@ class Gemini:
                     self._client.aio.models.generate_content(
                         model=model, contents=prompt, config=config
                     ),
-                    timeout=timeout or self._settings.gemini_timeout,
+                    timeout=self._settings.gemini_timeout,
                 )
             except asyncio.TimeoutError:
                 logger.warning("Gemini таймаут (попытка %d/%d).", attempt, retries)

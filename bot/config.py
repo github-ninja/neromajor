@@ -58,7 +58,7 @@ class Settings:
     gemini_rpm: int  # client-side cap on requests per minute per model (free tier friendly)
     # Total time a conversational reply may take before a canned one is sent.
     gemini_reply_deadline: float
-    gemini_reply_attempt_timeout: float  # per attempt within that deadline
+    gemini_reply_hedge_after: float  # then the lite model is asked in parallel
 
     timezone: ZoneInfo
     active_hour_start: int
@@ -114,8 +114,8 @@ class Settings:
             gemini_timeout=_float("GEMINI_TIMEOUT", 90.0, minimum=1.0),
             gemini_retries=_int("GEMINI_RETRIES", 4, minimum=1),
             gemini_rpm=_int("GEMINI_RPM", 10, minimum=1),
-            gemini_reply_deadline=_float("GEMINI_REPLY_DEADLINE", 25.0, minimum=1.0),
-            gemini_reply_attempt_timeout=_float("GEMINI_REPLY_ATTEMPT_TIMEOUT", 10.0, minimum=1.0),
+            gemini_reply_deadline=_float("GEMINI_REPLY_DEADLINE", 120.0, minimum=1.0),
+            gemini_reply_hedge_after=_float("GEMINI_REPLY_HEDGE_AFTER", 15.0, minimum=1.0),
             timezone=ZoneInfo(_str("BOT_TIMEZONE", "Europe/Moscow")),
             active_hour_start=start,
             active_hour_end=end,

@@ -183,20 +183,37 @@ async def test_rate_limit_is_per_model(make, monkeypatch):
     assert waits == []  # the fallback model has its own, still empty, schedule
 
 
+def slow_main(g, calls, main_answer, lite_answer):
+    """Main model answers only after the lite one has been asked and has replied."""
+    lite_replied = asyncio.Event()
+
+    async def generate_content(**kwargs):
+        calls.append(kwargs["model"])
+        if kwargs["model"] == g._settings.gemini_model:
+            await lite_replied.wait()
+            return main_answer
+        lite_replied.set()
+        if isinstance(lite_answer, Exception):
+            raise lite_answer
+        return lite_answer
+
+    g._client.aio.models.generate_content = generate_content
+    g._settings = dataclasses.replace(g._settings, gemini_reply_hedge_after=0.02, gemini_retries=1)
+
+
 @pytest.mark.asyncio
-async def test_hung_attempt_is_abandoned_and_retried_within_deadline(make):
-    g, calls = make([])
-    g._settings = dataclasses.replace(g._settings, gemini_reply_attempt_timeout=0.02)
+async def test_slow_main_model_is_raced_against_lite(make):
+    g, calls = make([], fallback=True)
+    slow_main(g, calls, ok("основная"), ok("лайт"))
+    assert await g.text("x", deadline=5) == "лайт"
+    assert calls == [g._settings.gemini_model, g._settings.gemini_lite_model]
 
-    async def hang_once(**kwargs):
-        calls.append(kwargs)
-        if len(calls) == 1:
-            await asyncio.Event().wait()
-        return ok("со второй попытки")
 
-    g._client.aio.models.generate_content = hang_once
-    assert await g.text("x", deadline=5) == "со второй попытки"
-    assert len(calls) == 2
+@pytest.mark.asyncio
+async def test_slow_main_model_still_answers_if_lite_fails(make):
+    g, calls = make([], fallback=True)
+    slow_main(g, calls, ok("основная"), api_error(503, "high demand"))
+    assert await g.text("x", deadline=5) == "основная"
 
 
 @pytest.mark.asyncio
