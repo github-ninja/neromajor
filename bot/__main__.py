@@ -22,6 +22,7 @@ logger = logging.getLogger("bot")
 
 async def run(settings: Settings) -> None:
     pool = await db.create_pool(settings.db_url, settings.db_pool_min, settings.db_pool_max)
+    ai: Gemini | None = None
     try:
         await db.migrate(pool)
         repo = Repository(pool)
@@ -63,6 +64,8 @@ async def run(settings: Settings) -> None:
         dp.shutdown.register(on_shutdown)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        if ai is not None:
+            await ai.close()
         await pool.close()
 
 

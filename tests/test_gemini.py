@@ -184,16 +184,16 @@ async def test_rate_limit_is_per_model(make, monkeypatch):
 
 
 def slow_main(g, calls, main_answer, lite_answer):
-    """Main model answers only after the lite one has been asked and has replied."""
-    lite_replied = asyncio.Event()
+    """Main model is silent until the lite one has been asked and has failed."""
+    lite_failed = asyncio.Event()
 
     async def generate_content(**kwargs):
         calls.append(kwargs["model"])
         if kwargs["model"] == g._settings.gemini_model:
-            await lite_replied.wait()
+            await lite_failed.wait()
             return main_answer
-        lite_replied.set()
         if isinstance(lite_answer, Exception):
+            lite_failed.set()
             raise lite_answer
         return lite_answer
 
@@ -229,3 +229,20 @@ async def test_calls_without_deadline_keep_the_long_timeout(make, monkeypatch):
     g, _ = make([ok()])
     await g.text("x")
     assert seen == [g._settings.gemini_timeout]
+
+
+@pytest.mark.asyncio
+async def test_node_refusing_location_is_skipped(monkeypatch):
+    from bot.ai import routing
+
+    async def getaddrinfo(host, port, **kwargs):
+        return [(0, 0, 0, "", (ip, port)) for ip in ("1.1.1.1", "2.2.2.2")]
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", getaddrinfo)
+    resolver = routing.NodeResolver()
+    with routing.track() as used:
+        await resolver.resolve("gemini.example", 443)
+    resolver.refused(used)
+    for _ in range(20):
+        [node] = await resolver.resolve("gemini.example", 443)
+        assert node["host"] != used[0]

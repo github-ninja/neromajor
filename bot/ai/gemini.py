@@ -12,6 +12,7 @@ from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 from pydantic import BaseModel, ValidationError
 
+from bot.ai import routing
 from bot.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -100,10 +101,13 @@ def _is_hard_quota(exc: genai_errors.APIError, delay: float | None) -> bool:
     return "billing" in text
 
 
+def _refused_location(exc: genai_errors.APIError) -> bool:
+    """"User location is not supported": the exit node we went through, see routing."""
+    return exc.code == 400 and "location" in (exc.message or "").lower()
+
+
 def _is_transient(exc: genai_errors.APIError) -> bool:
-    # "User location is not supported" comes and goes here: the API is reached
-    # through DNS-based routing whose exit point varies between requests.
-    return exc.code >= 500 or (exc.code == 400 and "location" in (exc.message or "").lower())
+    return exc.code >= 500 or _refused_location(exc)
 
 
 async def _first_success(*tasks: asyncio.Future[R]) -> R:
@@ -125,12 +129,27 @@ async def _first_success(*tasks: asyncio.Future[R]) -> R:
 class Gemini:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._client = genai.Client(api_key=settings.gemini_api_key)
+        self._nodes = routing.NodeResolver()
+        self._client: Any = None  # created on first use: aiohttp needs a running loop
+        self._session: Any = None
         # Per model, like Google's quotas: falling back to the lite model must
         # not queue behind the main model's request that just failed.
         self._limiters: dict[str, _RateLimiter] = {}
         # Quotas are per model, so is the pause after exhausting one.
         self._paused_until: dict[str, float] = {}
+
+    def _api(self) -> Any:
+        if self._client is None:
+            self._session = routing.session(self._nodes)
+            self._client = genai.Client(
+                api_key=self._settings.gemini_api_key,
+                http_options=genai_types.HttpOptions(aiohttp_client=self._session),
+            )
+        return self._client
+
+    async def close(self) -> None:
+        if self._session is not None:
+            await self._session.close()
 
     def _config(self, system: str | None, **extra: Any) -> genai_types.GenerateContentConfig:
         kwargs: dict[str, Any] = {"system_instruction": system, **extra}
@@ -240,12 +259,13 @@ class Gemini:
                 "Gemini [%s] попытка %d/%d, промпт %d симв.", model, attempt, retries, len(prompt)
             )
             try:
-                response = await asyncio.wait_for(
-                    self._client.aio.models.generate_content(
-                        model=model, contents=prompt, config=config
-                    ),
-                    timeout=self._settings.gemini_timeout,
-                )
+                with routing.track() as nodes:
+                    response = await asyncio.wait_for(
+                        self._api().aio.models.generate_content(
+                            model=model, contents=prompt, config=config
+                        ),
+                        timeout=self._settings.gemini_timeout,
+                    )
             except asyncio.TimeoutError:
                 logger.warning("Gemini таймаут (попытка %d/%d).", attempt, retries)
                 if last:
@@ -270,10 +290,13 @@ class Gemini:
                         ) from exc
                     await asyncio.sleep(delay)
                     continue
+                if _refused_location(exc):
+                    self._nodes.refused(nodes)
                 if _is_transient(exc) and not last:
                     logger.warning("Gemini %d (попытка %d/%d): %s",
                                    exc.code, attempt, retries, exc.message)
-                    await asyncio.sleep(2 ** attempt)
+                    # Another node will serve the retry: no need to wait.
+                    await asyncio.sleep(0 if _refused_location(exc) else 2 ** attempt)
                     continue
                 logger.error("Gemini ошибка %s: %s", exc.code, exc.message)
                 raise AIError("Ошибка связи с ИИ.") from exc
